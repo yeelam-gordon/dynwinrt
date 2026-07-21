@@ -21,6 +21,10 @@ struct LoadedLibrary {
 
 impl LoadedLibrary {
     fn load(dll: &str) -> Result<Self> {
+        if dll.encode_utf16().any(|unit| unit == 0) {
+            return Err(invalid_arg_error());
+        }
+
         unsafe { LoadLibraryW(&HSTRING::from(dll)) }
             .map(|module| Self {
                 module,
@@ -61,10 +65,14 @@ impl WideStringArg {
     }
 }
 
-pub fn wide_string_arg(value: &str) -> WideStringArg {
+pub fn wide_string_arg(value: &str) -> Result<WideStringArg> {
+    if value.encode_utf16().any(|unit| unit == 0) {
+        return Err(invalid_arg_error());
+    }
+
     let mut buffer: Vec<u16> = value.encode_utf16().collect();
     buffer.push(0);
-    WideStringArg { buffer }
+    Ok(WideStringArg { buffer })
 }
 
 pub fn get_last_error() -> u32 {
@@ -179,6 +187,7 @@ fn unsupported_platform_error() -> Error {
 #[cfg(all(test, windows, target_pointer_width = "64"))]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::WIN32_ERROR;
 
     fn invoke(
         dll: &str,
@@ -226,7 +235,7 @@ mod tests {
 
     #[test]
     fn flat_call_lstrlenw_accepts_wide_string_pointer() -> Result<()> {
-        let hello = wide_string_arg("hello");
+        let hello = wide_string_arg("hello")?;
         let result = invoke(
             "kernel32.dll",
             "lstrlenW",
@@ -235,7 +244,7 @@ mod tests {
         )?;
         assert_eq!(result.as_i32(), Some(5));
 
-        let empty = wide_string_arg("");
+        let empty = wide_string_arg("")?;
         let result = invoke(
             "kernel32.dll",
             "lstrlenW",
@@ -253,6 +262,17 @@ mod tests {
     }
 
     #[test]
+    fn flat_call_rejects_interior_nul_dll_name() {
+        let result = invoke(
+            "kernel32.dll\0ignored.dll",
+            "MulDiv",
+            FlatReturnKind::I32,
+            &[],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn flat_call_nonexistent_export_returns_error() {
         let result = invoke(
             "kernel32.dll",
@@ -264,8 +284,14 @@ mod tests {
     }
 
     #[test]
+    fn wide_string_arg_rejects_interior_nul() {
+        assert!(wide_string_arg("prefix\0suffix").is_err());
+    }
+
+    #[test]
     fn flat_call_get_module_handlew_uses_get_last_error_model() -> Result<()> {
-        let bogus_module = wide_string_arg("no_such_module_xyz.dll");
+        let bogus_module = wide_string_arg("no_such_module_xyz.dll")?;
+        unsafe { SetLastError(WIN32_ERROR(0)) };
         let result = invoke(
             "kernel32.dll",
             "GetModuleHandleW",
