@@ -654,7 +654,7 @@ impl DynWinRTValue {
   #[napi]
   pub fn pointer(
     #[napi(
-      ts_arg_type = "bigint | Buffer | Uint8Array | DynWinRtValue | null | undefined"
+    ts_arg_type = "bigint | number | Buffer | Uint8Array | DynWinRtValue | null | undefined"
     )]
     value: napi::bindgen_prelude::Unknown,
   ) -> napi::Result<DynWinRTValue> {
@@ -685,12 +685,44 @@ impl DynWinRTValue {
 
     // Fast path 3: Number → cast to usize (handy for HWNDs that fit in a
     // JS number; the caller can also pass BigInt for safety).
+    //
+    // A float→int cast in Rust saturates and silently accepts NaN, negative,
+    // fractional, and >2^53 values — any of which could produce a bogus
+    // pointer. Validate that the value is a finite, non-negative safe
+    // integer that fits in usize, and require BigInt otherwise.
     if val_type == sys::ValueType::napi_number {
       let mut d: f64 = 0.0;
       unsafe { sys::napi_get_value_double(raw_env, raw_val, &mut d) };
-      let bits = d as u64 as usize;
+      if !d.is_finite() {
+        return Err(napi::Error::from_reason(
+          "pointer(): number must be finite (got NaN or Infinity); use bigint for arbitrary pointer values",
+        ));
+      }
+      if d < 0.0 {
+        return Err(napi::Error::from_reason(
+          "pointer(): number must be non-negative; use bigint for arbitrary pointer values",
+        ));
+      }
+      if d.fract() != 0.0 {
+        return Err(napi::Error::from_reason(
+          "pointer(): number must be an integer; use bigint for arbitrary pointer values",
+        ));
+      }
+      // JS Number can only faithfully represent integers up to 2^53 - 1.
+      const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0; // (1 << 53) - 1
+      if d > MAX_SAFE_INTEGER {
+        return Err(napi::Error::from_reason(
+          "pointer(): number exceeds Number.MAX_SAFE_INTEGER; use bigint for arbitrary pointer values",
+        ));
+      }
+      let bits = d as u64;
+      if (bits as usize as u64) != bits {
+        return Err(napi::Error::from_reason(
+          "pointer(): number exceeds usize range on this platform; use bigint",
+        ));
+      }
       return Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
-        bits as *mut std::ffi::c_void,
+        bits as usize as *mut std::ffi::c_void,
       )));
     }
 

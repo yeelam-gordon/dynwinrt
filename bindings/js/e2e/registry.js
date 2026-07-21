@@ -112,7 +112,23 @@ function resolveHive(hive) {
 
 // Build a NUL-terminated UTF-16LE buffer suitable for an LPCWSTR argument.
 // Buffer.alloc zeroes so the trailing wchar_t NUL is already in place.
+//
+// Win32 wide-string APIs consume NUL-terminated UTF-16 strings, so any
+// embedded U+0000 would silently truncate the value at the first NUL and
+// could be exploited to bypass caller-side validation (e.g. subkey path
+// checks). Reject such inputs up front.
 function wideStringBuffer(str) {
+    if (typeof str !== 'string') {
+        throw new TypeError(
+            `wideStringBuffer: expected string, got ${typeof str}`,
+        );
+    }
+    if (str.indexOf('\u0000') !== -1) {
+        throw new RangeError(
+            'wideStringBuffer: input contains embedded NUL (U+0000), ' +
+                'which would be truncated by Win32 wide-string APIs',
+        );
+    }
     const buf = Buffer.alloc((str.length + 1) * 2);
     buf.write(str, 'utf16le');
     return buf;
