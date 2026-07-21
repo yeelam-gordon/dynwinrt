@@ -8,9 +8,7 @@ use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows_core::{GUID, HRESULT, HSTRING, Interface};
 
 fn init_winrt() {
-    // The process may already be initialized by another test; both success and
-    // already-initialized failures are acceptable for these headless WinRT calls.
-    let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.expect("RoInitialize should succeed");
 }
 
 fn assert_hstring(value: &WinRTValue, expected: &str) {

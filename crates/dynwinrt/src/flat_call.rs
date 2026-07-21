@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use std::ffi::CString;
 
 use libffi::middle::{Arg, Cif, CodePtr, Type};
-use windows::Win32::Foundation::{FreeLibrary, GetLastError, HMODULE};
+use windows::Win32::Foundation::{FreeLibrary, GetLastError, HMODULE, SetLastError};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_core::{HRESULT, HSTRING, PCSTR};
 
@@ -37,7 +37,9 @@ impl LoadedLibrary {
 impl Drop for LoadedLibrary {
     fn drop(&mut self) {
         unsafe {
+            let last_error = GetLastError();
             let _ = FreeLibrary(self.0);
+            SetLastError(last_error);
         }
     }
 }
@@ -63,34 +65,49 @@ pub fn get_last_error() -> u32 {
     unsafe { GetLastError().0 }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatReturnKind {
+    I32,
+    U32,
+    Ptr,
+}
+
 pub fn flat_invoke(
     dll: &str,
     entry: &str,
-    ret: TypeKind,
+    ret: FlatReturnKind,
     args: &[WinRTValue],
 ) -> Result<WinRTValue> {
-    let library = LoadedLibrary::load(dll)?;
-    let proc = library.proc_address(entry)?;
-    let arg_types = args
-        .iter()
-        .map(flat_arg_type)
-        .collect::<Result<Vec<Type>>>()?;
-    let ffi_args = args.iter().map(flat_arg).collect::<Result<Vec<Arg>>>()?;
-    let ret_type = flat_return_type(ret)?;
-    let cif = Cif::new(arg_types, ret_type);
+    #[cfg(not(all(windows, target_pointer_width = "64")))]
+    {
+        let _ = (dll, entry, ret, args);
+        return Err(unsupported_platform_error());
+    }
 
-    // On x64 Windows there is a single native calling convention, so libffi's
-    // default ABI is correct for Winapi/stdcall and cdecl flat exports.
-    unsafe { call_and_convert(&cif, proc, &ffi_args, ret) }
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        let library = LoadedLibrary::load(dll)?;
+        let proc = library.proc_address(entry)?;
+        let arg_types = args
+            .iter()
+            .map(flat_arg_type)
+            .collect::<Result<Vec<Type>>>()?;
+        let ffi_args = args.iter().map(flat_arg).collect::<Result<Vec<Arg>>>()?;
+        let ret_type = flat_return_type(ret)?;
+        let cif = Cif::new(arg_types, ret_type);
+
+        // On x64 Windows there is a single native calling convention, so libffi's
+        // default ABI is correct for Winapi/stdcall and cdecl flat exports.
+        unsafe { call_and_convert(&cif, proc, &ffi_args, ret) }
+    }
 }
 
 fn flat_arg_type(value: &WinRTValue) -> Result<Type> {
     match value {
         WinRTValue::RawPtr(_) | WinRTValue::Null => Ok(Type::pointer()),
-        _ => value
-            .get_type_kind()
-            .primitive_libffi_type()
-            .ok_or_else(|| Error::InvalidType(TypeKind::I32, value.get_type_kind())),
+        WinRTValue::I32(_) => Ok(Type::i32()),
+        WinRTValue::U32(_) => Ok(Type::u32()),
+        _ => Err(Error::InvalidType(TypeKind::I32, value.get_type_kind())),
     }
 }
 
@@ -103,12 +120,11 @@ fn flat_arg(value: &WinRTValue) -> Result<Arg<'_>> {
     }
 }
 
-fn flat_return_type(kind: TypeKind) -> Result<Type> {
+fn flat_return_type(kind: FlatReturnKind) -> Result<Type> {
     match kind {
-        TypeKind::Object => Ok(Type::pointer()),
-        _ => kind
-            .primitive_libffi_type()
-            .ok_or_else(|| Error::InvalidType(TypeKind::I32, kind)),
+        FlatReturnKind::I32 => Ok(Type::i32()),
+        FlatReturnKind::U32 => Ok(Type::u32()),
+        FlatReturnKind::Ptr => Ok(Type::pointer()),
     }
 }
 
@@ -116,21 +132,27 @@ unsafe fn call_and_convert(
     cif: &Cif,
     proc: *mut c_void,
     args: &[Arg<'_>],
-    ret: TypeKind,
+    ret: FlatReturnKind,
 ) -> Result<WinRTValue> {
     match ret {
-        TypeKind::I32 => Ok(WinRTValue::I32(unsafe { cif.call(CodePtr(proc), args) })),
-        TypeKind::U32 => Ok(WinRTValue::U32(unsafe { cif.call(CodePtr(proc), args) })),
-        TypeKind::Object => Ok(WinRTValue::RawPtr(unsafe {
+        FlatReturnKind::I32 => Ok(WinRTValue::I32(unsafe { cif.call(CodePtr(proc), args) })),
+        FlatReturnKind::U32 => Ok(WinRTValue::U32(unsafe { cif.call(CodePtr(proc), args) })),
+        FlatReturnKind::Ptr => Ok(WinRTValue::RawPtr(unsafe {
             cif.call::<*mut c_void>(CodePtr(proc), args)
         })),
-        _ => Err(Error::InvalidType(TypeKind::I32, ret)),
     }
 }
 
 fn invalid_arg_error() -> Error {
     Error::WindowsError(windows_core::Error::from_hresult(HRESULT(
         0x80070057u32 as i32,
+    )))
+}
+
+#[cfg(not(all(windows, target_pointer_width = "64")))]
+fn unsupported_platform_error() -> Error {
+    Error::WindowsError(windows_core::Error::from_hresult(HRESULT(
+        0x80004001u32 as i32,
     )))
 }
 
@@ -143,7 +165,7 @@ mod tests {
         let result = flat_invoke(
             "kernel32.dll",
             "MulDiv",
-            TypeKind::I32,
+            FlatReturnKind::I32,
             &[WinRTValue::I32(100), WinRTValue::I32(3), WinRTValue::I32(2)],
         )?;
         assert_eq!(result.as_i32(), Some(150));
@@ -151,7 +173,7 @@ mod tests {
         let rounded = flat_invoke(
             "kernel32.dll",
             "MulDiv",
-            TypeKind::I32,
+            FlatReturnKind::I32,
             &[WinRTValue::I32(7), WinRTValue::I32(1), WinRTValue::I32(2)],
         )?;
         assert_eq!(rounded.as_i32(), Some(4));
@@ -160,8 +182,16 @@ mod tests {
 
     #[test]
     fn flat_call_get_current_process_id_matches_rust_process_id() -> Result<()> {
-        let result = flat_invoke("kernel32.dll", "GetCurrentProcessId", TypeKind::U32, &[])?;
-        assert_eq!(result.as_i32(), Some(std::process::id() as i32));
+        let result = flat_invoke(
+            "kernel32.dll",
+            "GetCurrentProcessId",
+            FlatReturnKind::U32,
+            &[],
+        )?;
+        let WinRTValue::U32(pid) = result else {
+            panic!("expected U32 process id");
+        };
+        assert_eq!(pid, std::process::id());
         Ok(())
     }
 
@@ -171,7 +201,7 @@ mod tests {
         let result = flat_invoke(
             "kernel32.dll",
             "lstrlenW",
-            TypeKind::I32,
+            FlatReturnKind::I32,
             &[hello.as_winrt_value()],
         )?;
         assert_eq!(result.as_i32(), Some(5));
@@ -180,7 +210,7 @@ mod tests {
         let result = flat_invoke(
             "kernel32.dll",
             "lstrlenW",
-            TypeKind::I32,
+            FlatReturnKind::I32,
             &[empty.as_winrt_value()],
         )?;
         assert_eq!(result.as_i32(), Some(0));
@@ -189,13 +219,18 @@ mod tests {
 
     #[test]
     fn flat_call_nonexistent_dll_returns_error() {
-        let result = flat_invoke("no_such_dll_xyz.dll", "MulDiv", TypeKind::I32, &[]);
+        let result = flat_invoke("no_such_dll_xyz.dll", "MulDiv", FlatReturnKind::I32, &[]);
         assert!(result.is_err());
     }
 
     #[test]
     fn flat_call_nonexistent_export_returns_error() {
-        let result = flat_invoke("kernel32.dll", "ThisExportDoesNotExist", TypeKind::I32, &[]);
+        let result = flat_invoke(
+            "kernel32.dll",
+            "ThisExportDoesNotExist",
+            FlatReturnKind::I32,
+            &[],
+        );
         assert!(result.is_err());
     }
 
@@ -205,7 +240,7 @@ mod tests {
         let result = flat_invoke(
             "kernel32.dll",
             "GetModuleHandleW",
-            TypeKind::Object,
+            FlatReturnKind::Ptr,
             &[bogus_module.as_winrt_value()],
         )?;
         let WinRTValue::RawPtr(module) = result else {
