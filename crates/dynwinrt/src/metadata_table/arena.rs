@@ -40,6 +40,9 @@ pub(super) struct EnumData {
 pub(super) struct InterfaceMethodTable {
     pub(super) method_names: Vec<String>,
     pub(super) method_indices: Vec<u32>,
+    /// First user-method vtable slot for this interface.
+    /// 6 for IInspectable-based (WinRT) interfaces, 3 for IUnknown-based (classic COM).
+    pub(super) base_slot: usize,
 }
 
 // ===========================================================================
@@ -114,6 +117,12 @@ impl MetadataTable {
 
     /// Create an interface method table. Called only when dedup already checked by caller.
     pub(super) fn create_interface_method_table(&self, iid: GUID) {
+        self.create_interface_method_table_with_base(iid, 6);
+    }
+
+    /// Create an interface method table with a specific base vtable slot.
+    /// 6 = IInspectable-based (WinRT), 3 = IUnknown-based (classic COM).
+    pub(super) fn create_interface_method_table_with_base(&self, iid: GUID, base_slot: usize) {
         self.interface_methods
             .write()
             .unwrap()
@@ -121,6 +130,7 @@ impl MetadataTable {
             .or_insert_with(|| InterfaceMethodTable {
                 method_names: Vec::new(),
                 method_indices: Vec::new(),
+                base_slot,
             });
     }
 
@@ -134,10 +144,10 @@ impl MetadataTable {
 
         // Dedup: if method name already registered, return existing vtable index
         if let Some(pos) = table.method_names.iter().position(|n| n == name) {
-            return (6 + pos) as u32;
+            return (table.base_slot + pos) as u32;
         }
 
-        let vtable_index = 6 + table.method_indices.len();
+        let vtable_index = table.base_slot + table.method_indices.len();
         let method = sig.build(vtable_index);
         let arena_index = self.methods.push(method);
         table.method_names.push(name.to_string());
@@ -234,12 +244,12 @@ impl MetadataTable {
         iid: &GUID,
         vtable_index: usize,
     ) -> Option<u32> {
-        if vtable_index < 6 {
-            return None;
-        }
-        let local_index = vtable_index - 6;
         let iface_methods = self.interface_methods.read().unwrap();
         let table = iface_methods.get(iid)?;
+        if vtable_index < table.base_slot {
+            return None;
+        }
+        let local_index = vtable_index - table.base_slot;
         table.method_indices.get(local_index).copied()
     }
 

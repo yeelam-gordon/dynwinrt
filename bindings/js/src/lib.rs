@@ -7,6 +7,7 @@
 use std::sync::{Arc, OnceLock};
 
 use dynwinrt;
+use napi::JsValue;
 use napi::bindgen_prelude::BigInt;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi_derive::napi;
@@ -270,6 +271,47 @@ impl DynWinRTType {
     DynWinRTType(TABLE.register_interface(&name, iid.0))
   }
 
+  /// Register a classic-COM (IUnknown-based) interface.
+  /// Returns self (Interface TypeHandle) for chaining `.addMethod()`.
+  /// User methods start at vtable slot 3 (QueryInterface/AddRef/Release are 0/1/2).
+  #[napi]
+  pub fn register_interface_unknown(name: String, iid: &WinGUID) -> Self {
+    DynWinRTType(TABLE.register_interface_iunknown(&name, iid.0))
+  }
+
+  /// Type-only alias for `object()` used by the classic-COM codegen. Any
+  /// pointer/handle (HWND, PWSTR, void*, function pointer, ...) is passed by
+  /// its raw ABI value; the value factory `DynWinRtValue.pointer(...)` builds
+  /// the matching `WinRTValue::RawPtr`.
+  #[napi]
+  pub fn pointer() -> Self {
+    DynWinRTType(TABLE.object())
+  }
+
+  /// Alias for `i32()` — matches the `xxxType()` naming used by codegen.
+  #[napi]
+  pub fn i32_type() -> Self {
+    DynWinRTType(TABLE.i32_type())
+  }
+
+  /// Alias for `u32()` — matches the `xxxType()` naming used by codegen.
+  #[napi]
+  pub fn u32_type() -> Self {
+    DynWinRTType(TABLE.u32_type())
+  }
+
+  /// Alias for `i64()` — matches the `xxxType()` naming used by codegen.
+  #[napi]
+  pub fn i64_type() -> Self {
+    DynWinRTType(TABLE.i64_type())
+  }
+
+  /// Alias for `u64()` — matches the `xxxType()` naming used by codegen.
+  #[napi]
+  pub fn u64_type() -> Self {
+    DynWinRTType(TABLE.u64_type())
+  }
+
   /// Add a method to this interface using a MethodSignature.
   /// Methods are numbered starting at vtable index 6.
   #[napi]
@@ -277,7 +319,10 @@ impl DynWinRTType {
     DynWinRTType(self.0.clone().add_method(&name, sig.0.clone()))
   }
 
-  /// Get a MethodHandle by vtable index (6 = first user method).
+  /// Get a MethodHandle by vtable index. For IInspectable-based interfaces
+  /// (WinRT / `registerInterface`), the first user method is at slot 6. For
+  /// classic COM interfaces (`registerInterfaceUnknown`), the first user
+  /// method is at slot 3.
   #[napi]
   pub fn method(&self, vtable_index: i32) -> napi::Result<DynWinRTMethodHandle> {
     self
@@ -571,6 +616,167 @@ impl DynWinRTValue {
       })
   }
 
+  /// Create a classic-COM instance via `CoCreateInstance(clsid, CLSCTX_INPROC_SERVER)` and QI to `iid`.
+  #[napi]
+  pub fn co_create_instance(clsid_str: String, iid: &WinGUID) -> napi::Result<DynWinRTValue> {
+    let clsid = windows::core::GUID::try_from(clsid_str.as_str())
+      .map_err(|_| napi::Error::from_reason(format!("Invalid CLSID: '{}'", clsid_str)))?;
+    dynwinrt::classic_com::co_create_instance(clsid, iid.0)
+      .map(DynWinRTValue)
+      .map_err(|e| {
+        napi::Error::from_reason(format!(
+          "CoCreateInstance({}, {}) failed: {}",
+          clsid_str,
+          iid.to_string(),
+          e.message()
+        ))
+      })
+  }
+
+  /// Wrap a pointer/handle (BigInt, Buffer, or another `DynWinRtValue` holding
+  /// an object/raw pointer) as a `WinRTValue::RawPtr` for classic-COM calls
+  /// with `void*` / HWND / PWSTR / function-pointer parameters.
+  ///
+  /// Accepts:
+  ///   - BigInt: interpreted as a raw pointer value (u64 on x64).
+  ///   - Buffer: uses the buffer's byte-pointer directly (does not clone).
+  ///     Caller keeps the Buffer alive for the duration of the COM call.
+  ///   - DynWinRtValue: reuses its underlying pointer (Object/RawPtr) or
+  ///     handles Null.
+  ///   - null/undefined: null pointer.
+  #[napi]
+  pub fn pointer(
+    #[napi(
+      ts_arg_type = "bigint | Buffer | Uint8Array | DynWinRtValue | null | undefined"
+    )]
+    value: napi::bindgen_prelude::Unknown,
+  ) -> napi::Result<DynWinRTValue> {
+    use napi::bindgen_prelude::FromNapiValue;
+    use napi::sys;
+
+    let raw_env = value.value().env;
+    let raw_val = value.value().value;
+
+    // Fast path 1: null / undefined → null pointer
+    let mut val_type = sys::ValueType::napi_undefined;
+    unsafe { sys::napi_typeof(raw_env, raw_val, &mut val_type) };
+    if val_type == sys::ValueType::napi_null || val_type == sys::ValueType::napi_undefined {
+      return Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
+        std::ptr::null_mut(),
+      )));
+    }
+
+    // Fast path 2: BigInt → parse as u64 pointer bits
+    if val_type == sys::ValueType::napi_bigint {
+      let bi =
+        unsafe { napi::bindgen_prelude::BigInt::from_napi_value(raw_env, raw_val) }?;
+      let (_sign, n, _lossless) = bi.get_u64();
+      return Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
+        n as usize as *mut std::ffi::c_void,
+      )));
+    }
+
+    // Fast path 3: Number → cast to usize (handy for HWNDs that fit in a
+    // JS number; the caller can also pass BigInt for safety).
+    if val_type == sys::ValueType::napi_number {
+      let mut d: f64 = 0.0;
+      unsafe { sys::napi_get_value_double(raw_env, raw_val, &mut d) };
+      let bits = d as u64 as usize;
+      return Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
+        bits as *mut std::ffi::c_void,
+      )));
+    }
+
+    // Fast path 4: Buffer / Uint8Array → base data pointer.
+    if let Ok(buf) =
+      unsafe { napi::bindgen_prelude::Buffer::from_napi_value(raw_env, raw_val) }
+    {
+      let slice: &[u8] = buf.as_ref();
+      return Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
+        slice.as_ptr() as *mut std::ffi::c_void,
+      )));
+    }
+
+    // Fast path 5: existing DynWinRtValue → reuse its pointer.
+    if let Ok(v) = unsafe { <&DynWinRTValue>::from_napi_value(raw_env, raw_val) } {
+      return match &v.0 {
+        dynwinrt::WinRTValue::Object(o) => Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
+          o.as_raw(),
+        ))),
+        dynwinrt::WinRTValue::RawPtr(p) => {
+          Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(*p)))
+        }
+        dynwinrt::WinRTValue::Null => Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
+          std::ptr::null_mut(),
+        ))),
+        _ => Err(napi::Error::from_reason(
+          "pointer(): DynWinRtValue must wrap an object or raw pointer",
+        )),
+      };
+    }
+
+    Err(napi::Error::from_reason(
+      "pointer(): expected bigint, Buffer, DynWinRtValue, null, or undefined",
+    ))
+  }
+
+  /// Get the underlying pointer of an Object/RawPtr value as a BigInt.
+  /// Useful for turning a `flatInvoke` pointer result (e.g. HWND from
+  /// `GetConsoleWindow`) into a bigint you can then feed into other calls.
+  #[napi]
+  pub fn as_pointer_bigint(&self) -> napi::Result<BigInt> {
+    let bits: usize = match &self.0 {
+      dynwinrt::WinRTValue::Object(o) => o.as_raw() as usize,
+      dynwinrt::WinRTValue::RawPtr(p) => *p as usize,
+      dynwinrt::WinRTValue::Null => 0,
+      _ => {
+        return Err(napi::Error::from_reason(format!(
+          "asPointerBigint: not a pointer/object value ({:?})",
+          self.0.get_type_kind()
+        )));
+      }
+    };
+    Ok(BigInt::from(bits as u64))
+  }
+
+  /// Invoke a flat Win32 export via `LoadLibraryW` + `GetProcAddress` + libffi.
+  /// `retKind` selects the return marshalling: `'I32' | 'U32' | 'Ptr'`.
+  ///
+  /// `args` may contain: `DynWinRtValue.i32(...)`, `DynWinRtValue.u32(...)`,
+  /// or `DynWinRtValue.pointer(...)`. Other kinds cause a runtime error.
+  #[napi]
+  pub fn flat_invoke(
+    dll: String,
+    entry: String,
+    ret_kind: String,
+    args: Vec<&DynWinRTValue>,
+  ) -> napi::Result<DynWinRTValue> {
+    let ret = match ret_kind.as_str() {
+      "I32" | "i32" => dynwinrt::flat_call::FlatReturnKind::I32,
+      "U32" | "u32" => dynwinrt::flat_call::FlatReturnKind::U32,
+      "Ptr" | "ptr" | "Pointer" | "pointer" => dynwinrt::flat_call::FlatReturnKind::Ptr,
+      other => {
+        return Err(napi::Error::from_reason(format!(
+          "flatInvoke: unsupported return kind '{}' (expected 'I32', 'U32', or 'Ptr')",
+          other
+        )));
+      }
+    };
+    let wrt_args: Vec<dynwinrt::WinRTValue> = args.iter().map(|a| a.0.clone()).collect();
+    let result = unsafe { dynwinrt::flat_call::flat_invoke(&dll, &entry, ret, &wrt_args) }
+      .map_err(|e| {
+        napi::Error::from_reason(format!("flatInvoke({}!{}): {}", dll, entry, e.message()))
+      })?;
+    Ok(DynWinRTValue(result))
+  }
+
+  /// Return `GetLastError()` as a u32. Companion to `flatInvoke` for functions
+  /// that use the SetLastError model (e.g. `GetModuleHandleW`).
+  #[napi]
+  pub fn flat_last_error() -> u32 {
+    dynwinrt::flat_call::get_last_error()
+  }
+
   #[napi]
   pub fn bool_value(value: bool) -> DynWinRTValue {
     DynWinRTValue(dynwinrt::WinRTValue::Bool(value))
@@ -603,9 +809,12 @@ impl DynWinRTValue {
   pub fn i64(value: i64) -> DynWinRTValue {
     DynWinRTValue(dynwinrt::WinRTValue::I64(value))
   }
+  /// Create a `u64` `WinRTValue` from a JS BigInt. The codegen emits
+  /// `DynWinRtValue.u64(BigInt(v))`, so this must accept a BigInt.
   #[napi]
-  pub fn u64(value: i64) -> DynWinRTValue {
-    DynWinRTValue(dynwinrt::WinRTValue::U64(value as u64))
+  pub fn u64(value: BigInt) -> DynWinRTValue {
+    let (_sign, n, _lossless) = value.get_u64();
+    DynWinRTValue(dynwinrt::WinRTValue::U64(n))
   }
   #[napi]
   pub fn f32(value: f64) -> DynWinRTValue {
