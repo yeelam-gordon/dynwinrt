@@ -288,7 +288,7 @@ fn coerce_input_object(
     let Some(iid) = expected_object_iid(expected) else {
         return Ok(None);
     };
-    if value.is_null_object() {
+    if value.is_null_object() || matches!(value, WinRTValue::RawPtr(_)) {
         return Ok(None);
     }
 

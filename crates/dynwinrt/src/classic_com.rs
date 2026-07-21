@@ -122,7 +122,20 @@ fn wide_to_string(buffer: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InterfaceSignature, MetadataTable, com_helpers::E_NOINTERFACE};
+    use crate::{
+        InterfaceSignature, MetadataTable, com_helpers::E_NOINTERFACE, ro_get_activation_factory_2,
+        roapi::query_interface,
+    };
+    use windows::{
+        ApplicationModel::DataTransfer::DataTransferManager,
+        Win32::{
+            UI::Shell::IDataTransferManagerInterop,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPED,
+            },
+        },
+    };
+    use windows_core::{HSTRING, Interface, w};
 
     const CLSID_SHELL_LINK: GUID = GUID::from_u128(0x00021401_0000_0000_c000_000000000046);
     const IID_ISHELL_LINK_W: GUID = GUID::from_u128(0x000214f9_0000_0000_c000_000000000046);
@@ -220,6 +233,72 @@ mod tests {
             result::Error::WindowsError(err) => assert_eq!(err.code(), E_NOINTERFACE),
             err => panic!("expected E_NOINTERFACE, got {err:?}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn data_transfer_manager_interop_get_for_window_returns_winrt_object_via_dynamic_iunknown_vtable()
+    -> result::Result<()> {
+        ensure_com_initialized()?;
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("dynwinrt data transfer interop test"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .map_err(result::Error::WindowsError)?;
+        struct WindowGuard(windows::Win32::Foundation::HWND);
+        impl Drop for WindowGuard {
+            fn drop(&mut self) {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+        let _window = WindowGuard(hwnd);
+
+        let factory = ro_get_activation_factory_2(&HSTRING::from(
+            "Windows.ApplicationModel.DataTransfer.DataTransferManager",
+        ))?;
+        let interop = query_interface(factory, &IDataTransferManagerInterop::IID)
+            .map_err(result::Error::WindowsError)?
+            .as_object()
+            .unwrap();
+
+        let table = MetadataTable::new();
+        let mut iface = InterfaceSignature::define_from_iunknown(
+            "IDataTransferManagerInterop",
+            IDataTransferManagerInterop::IID,
+            &table,
+        );
+        iface.add_method(
+            MethodSignature::new(&table)
+                .add_in(table.object())
+                .add_in(table.object())
+                .add_out(table.object()),
+        );
+
+        let target_iid = DataTransferManager::IID;
+        let result = iface.methods[3].call_dynamic(
+            interop.as_raw(),
+            &[
+                WinRTValue::RawPtr(hwnd.0 as *mut c_void),
+                WinRTValue::RawPtr(&target_iid as *const GUID as *mut c_void),
+            ],
+        )?;
+
+        let manager = result[0].as_object().expect("GetForWindow returned null");
+        assert!(!manager.as_raw().is_null());
+        let _typed: DataTransferManager = manager.cast().map_err(result::Error::WindowsError)?;
         Ok(())
     }
 }
