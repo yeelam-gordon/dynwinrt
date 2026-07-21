@@ -287,6 +287,22 @@ fn run() -> Result<(), String> {
                             com_interfaces.push(com_iface);
                             continue;
                         }
+                        // The type exists as an interface but is IInspectable-rooted and
+                        // not `*Interop` — it's a plain WinRT interface. Those still need
+                        // to go through the WinRT projection pipeline via `parse_class`,
+                        // which will find it if it's the projected surface of a runtime
+                        // class. If not, give a targeted error rather than the misleading
+                        // "Class not found".
+                        if meta::parse_class(&winmd, ns, cls).is_none() {
+                            return Err(format!(
+                                "{}.{} is an IInspectable-rooted WinRT interface, not a runtime class \
+                                 or classic-COM interface. `--class-name` expects a WinRT runtime class, \
+                                 an IUnknown-rooted classic COM interface, or a `*Interop` bridge. \
+                                 If you meant to project a WinRT interface directly, use the full \
+                                 namespace-projection mode (no `--class-name`).",
+                                ns, cls
+                            ));
+                        }
                     }
                     match meta::parse_class(&winmd, ns, cls) {
                         Some(mut c) => {
