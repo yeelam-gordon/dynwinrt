@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use dynwinrt;
 use napi::JsValue;
 use napi::bindgen_prelude::BigInt;
+use napi::bindgen_prelude::Either;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi_derive::napi;
 use windows::core::{IUnknown, Interface, HSTRING};
@@ -816,11 +817,17 @@ impl DynWinRTValue {
   pub fn i64(value: i64) -> DynWinRTValue {
     DynWinRTValue(dynwinrt::WinRTValue::I64(value))
   }
-  /// Create a `u64` `WinRTValue` from a JS BigInt. The codegen emits
-  /// `DynWinRtValue.u64(BigInt(v))`, so this must accept a BigInt.
-  #[napi]
-  pub fn u64(value: BigInt) -> DynWinRTValue {
-    let (_sign, n, _lossless) = value.get_u64();
+  /// Create a `u64` `WinRTValue`. Accepts either a JS `BigInt` (classic-COM
+  /// codegen emits `DynWinRtValue.u64(BigInt(v))`) or a plain JS `number`
+  /// (existing WinRT codegen emits `DynWinRtValue.u64(value)` for `UInt64`
+  /// params like stream seek/size). Accepting both keeps the WinRT path
+  /// working while supporting the 64-bit classic-COM path.
+  #[napi(ts_args_type = "value: bigint | number")]
+  pub fn u64(value: Either<BigInt, i64>) -> DynWinRTValue {
+    let n = match value {
+      Either::A(big) => big.get_u64().1,
+      Either::B(num) => num as u64,
+    };
     DynWinRTValue(dynwinrt::WinRTValue::U64(n))
   }
   #[napi]
