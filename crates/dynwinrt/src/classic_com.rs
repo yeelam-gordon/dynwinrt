@@ -77,7 +77,8 @@ pub fn call_method(
         .map_err(result::Error::WindowsError)
 }
 
-pub fn call_method_1_ptr(
+#[cfg(test)]
+fn call_method_1_ptr(
     vtable_index: usize,
     obj: *mut c_void,
     ptr: *const c_void,
@@ -87,7 +88,8 @@ pub fn call_method_1_ptr(
         .map_err(result::Error::WindowsError)
 }
 
-pub fn call_method_2_ptr_i32(
+#[cfg(test)]
+fn call_method_2_ptr_i32(
     vtable_index: usize,
     obj: *mut c_void,
     ptr: *mut c_void,
@@ -98,15 +100,18 @@ pub fn call_method_2_ptr_i32(
         .map_err(result::Error::WindowsError)
 }
 
-pub fn wide_null(text: &str) -> Vec<u16> {
+#[cfg(test)]
+fn wide_null(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub fn wide_buffer(characters: usize) -> Vec<u16> {
+#[cfg(test)]
+fn wide_buffer(characters: usize) -> Vec<u16> {
     vec![0; characters]
 }
 
-pub fn wide_to_string(buffer: &[u16]) -> String {
+#[cfg(test)]
+fn wide_to_string(buffer: &[u16]) -> String {
     let end = buffer
         .iter()
         .position(|ch| *ch == 0)
