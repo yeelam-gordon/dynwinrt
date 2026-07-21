@@ -137,13 +137,19 @@ fn flat_arg_type(value: &WinRTValue) -> Result<Type> {
         WinRTValue::RawPtr(_) => Ok(Type::pointer()),
         WinRTValue::I32(_) => Ok(Type::i32()),
         WinRTValue::U32(_) => Ok(Type::u32()),
+        WinRTValue::I64(_) => Ok(Type::i64()),
+        WinRTValue::U64(_) => Ok(Type::u64()),
         _ => Err(invalid_arg_error()),
     }
 }
 
 fn flat_arg(value: &WinRTValue) -> Result<Arg<'_>> {
     match value {
-        WinRTValue::I32(_) | WinRTValue::U32(_) | WinRTValue::RawPtr(_) => Ok(value.libffi_arg()),
+        WinRTValue::I32(_)
+        | WinRTValue::U32(_)
+        | WinRTValue::I64(_)
+        | WinRTValue::U64(_)
+        | WinRTValue::RawPtr(_) => Ok(value.libffi_arg()),
         _ => Err(invalid_arg_error()),
     }
 }
@@ -319,6 +325,242 @@ mod tests {
         };
         assert!(module.is_null());
         assert_eq!(get_last_error(), 126);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Registry marshalling primitives.
+    //
+    // These exercise the three flat-Win32 argument shapes needed by real
+    // Win32 APIs, using the advapi32 registry ABI:
+    //
+    //   1. Out handle via pointer-to-pointer
+    //      (RegOpenKeyExW's `PHKEY phkResult` last arg)
+    //   2. Caller-allocated in/out byte buffer + in/out DWORD size
+    //      (RegQueryValueExW's `LPBYTE lpData` + `LPDWORD lpcbData`)
+    //   3. Wide-string out buffer -> Rust String (UTF-16LE decode)
+    //
+    // Each buffer is a plain Vec/u32 slot owned by the test; we pass its
+    // address as a WinRTValue::RawPtr. That is exactly the same shape the
+    // napi layer uses when the JS caller passes a Node `Buffer` through
+    // `.pointer(buf)`. If these tests pass, the marshalling that the JS
+    // Registry wrapper depends on is proven at the Rust layer.
+    // ------------------------------------------------------------------
+
+    // HKEY_LOCAL_MACHINE — predefined pointer-sized HKEY constant.
+    // (The Win32 header defines this as (HKEY)(LONG_PTR)(LONG)0x80000002.)
+    const HKEY_LOCAL_MACHINE: usize = 0x80000002;
+
+    // KEY_READ = STANDARD_RIGHTS_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS
+    //          | KEY_NOTIFY
+    const KEY_READ: u32 = 0x20019;
+
+    // Win32 registry error codes (LSTATUS = LONG).
+    const ERROR_SUCCESS: i32 = 0;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_MORE_DATA: i32 = 234;
+
+    // REG_SZ registry value type.
+    const REG_SZ: u32 = 1;
+
+    /// RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions,
+    ///               REGSAM samDesired, PHKEY phkResult) -> LSTATUS
+    fn reg_open_key(parent: usize, sub_key: &str) -> Result<(i32, usize)> {
+        let sub_key_arg = wide_string_arg(sub_key)?;
+        // Caller-allocated slot for the out HKEY. Pass its address as a raw
+        // pointer. The callee writes an HKEY (pointer-sized) into it.
+        let mut hkey_out: usize = 0;
+        let phkey = WinRTValue::RawPtr(&mut hkey_out as *mut usize as *mut c_void);
+        let status = invoke(
+            "advapi32.dll",
+            "RegOpenKeyExW",
+            FlatReturnKind::I32,
+            &[
+                WinRTValue::RawPtr(parent as *mut c_void),
+                sub_key_arg.as_winrt_value(),
+                WinRTValue::U32(0), // ulOptions
+                WinRTValue::U32(KEY_READ),
+                phkey,
+            ],
+        )?;
+        let code = status.as_i32().expect("LSTATUS is a signed LONG");
+        Ok((code, hkey_out))
+    }
+
+    /// RegCloseKey(HKEY) -> LSTATUS
+    fn reg_close_key(hkey: usize) -> Result<i32> {
+        let status = invoke(
+            "advapi32.dll",
+            "RegCloseKey",
+            FlatReturnKind::I32,
+            &[WinRTValue::RawPtr(hkey as *mut c_void)],
+        )?;
+        Ok(status.as_i32().unwrap())
+    }
+
+    /// RegQueryValueExW(HKEY, LPCWSTR lpValueName, LPDWORD lpReserved,
+    ///                  LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData) -> LSTATUS
+    ///
+    /// Returns `(status, type, bytes_written, buffer)` where `buffer` is the
+    /// caller-allocated data buffer (unchanged on error but with valid length
+    /// on ERROR_MORE_DATA).
+    fn reg_query_value(
+        hkey: usize,
+        value_name: &str,
+        mut buffer: Vec<u8>,
+    ) -> Result<(i32, u32, u32, Vec<u8>)> {
+        let name_arg = wide_string_arg(value_name)?;
+        let mut reg_type: u32 = 0;
+        let mut cb_data: u32 = buffer.len() as u32; // in: capacity; out: bytes written
+        let data_ptr = if buffer.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buffer.as_mut_ptr() as *mut c_void
+        };
+        let status = invoke(
+            "advapi32.dll",
+            "RegQueryValueExW",
+            FlatReturnKind::I32,
+            &[
+                WinRTValue::RawPtr(hkey as *mut c_void),
+                name_arg.as_winrt_value(),
+                WinRTValue::RawPtr(std::ptr::null_mut()), // lpReserved
+                WinRTValue::RawPtr(&mut reg_type as *mut u32 as *mut c_void),
+                WinRTValue::RawPtr(data_ptr),
+                WinRTValue::RawPtr(&mut cb_data as *mut u32 as *mut c_void),
+            ],
+        )?;
+        Ok((status.as_i32().unwrap(), reg_type, cb_data, buffer))
+    }
+
+    /// Decode a REG_SZ payload (UTF-16LE bytes, possibly NUL-terminated) into
+    /// a Rust String. `cb_bytes` is the count reported by RegQueryValueExW.
+    fn decode_reg_sz(buffer: &[u8], cb_bytes: u32) -> String {
+        let byte_len = cb_bytes as usize;
+        assert!(byte_len <= buffer.len(), "cb_bytes exceeds buffer");
+        // REG_SZ values are wide-char aligned. Truncate a trailing NUL if any.
+        let mut u16s: Vec<u16> = buffer[..byte_len]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if u16s.last() == Some(&0) {
+            u16s.pop();
+        }
+        String::from_utf16_lossy(&u16s)
+    }
+
+    /// Normal path: open HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion,
+    /// read the REG_SZ "ProductName" value, and verify it looks like Windows.
+    ///
+    /// Proves: (a) HKEY out via pointer-to-pointer, (b) caller-allocated
+    /// LPBYTE lpData + in/out LPDWORD lpcbData, (c) UTF-16LE decode.
+    #[test]
+    fn flat_call_reads_registry_product_name() -> Result<()> {
+        let (status, hkey) = reg_open_key(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        )?;
+        assert_eq!(status, ERROR_SUCCESS, "RegOpenKeyExW failed: {status}");
+        assert_ne!(hkey, 0, "RegOpenKeyExW returned a null HKEY");
+
+        let buffer = vec![0u8; 512];
+        let (status, reg_type, cb, buffer) = reg_query_value(hkey, "ProductName", buffer)?;
+        // Always close the key, even if the query failed.
+        let close_status = reg_close_key(hkey)?;
+        assert_eq!(close_status, ERROR_SUCCESS);
+
+        assert_eq!(status, ERROR_SUCCESS, "RegQueryValueExW failed: {status}");
+        assert_eq!(reg_type, REG_SZ, "ProductName should be REG_SZ");
+        assert!(cb > 0, "cb_data should reflect bytes written");
+
+        let product_name = decode_reg_sz(&buffer, cb);
+        assert!(!product_name.is_empty(), "ProductName should not be empty");
+        assert!(
+            product_name.to_lowercase().contains("windows"),
+            "ProductName should mention Windows, got {product_name:?}"
+        );
+        Ok(())
+    }
+
+    /// Corner case: opening a non-existent subkey returns ERROR_FILE_NOT_FOUND
+    /// and the out HKEY slot stays null.
+    #[test]
+    fn flat_call_reg_open_key_missing_returns_file_not_found() -> Result<()> {
+        let (status, hkey) = reg_open_key(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\DynWinrt\NoSuchKey\Nope",
+        )?;
+        assert_eq!(status, ERROR_FILE_NOT_FOUND, "expected ERROR_FILE_NOT_FOUND");
+        assert_eq!(hkey, 0, "out HKEY should stay null on failure");
+        Ok(())
+    }
+
+    /// Corner case: querying a value that doesn't exist returns
+    /// ERROR_FILE_NOT_FOUND (the same LSTATUS the flat wrapper must surface).
+    #[test]
+    fn flat_call_reg_query_missing_value_returns_file_not_found() -> Result<()> {
+        let (status, hkey) = reg_open_key(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        )?;
+        assert_eq!(status, ERROR_SUCCESS);
+
+        let (query_status, _reg_type, _cb, _buf) =
+            reg_query_value(hkey, "ThisValueShouldNeverExist_DynWinrt", vec![0u8; 32])?;
+        let _ = reg_close_key(hkey)?;
+        assert_eq!(query_status, ERROR_FILE_NOT_FOUND);
+        Ok(())
+    }
+
+    /// Corner case: buffer-too-small returns ERROR_MORE_DATA and the in/out
+    /// `lpcbData` slot is rewritten with the required byte count. This
+    /// specifically proves the in/out DWORD marshalling: we pass 4 in and
+    /// read a >4 out from the same slot.
+    ///
+    /// NOTE: RegQueryValueExW treats `lpData == NULL` as a size-query and
+    /// returns SUCCESS, not ERROR_MORE_DATA. We therefore pass a real (too
+    /// small) buffer.
+    #[test]
+    fn flat_call_reg_query_buffer_too_small_reports_required_size() -> Result<()> {
+        let (status, hkey) = reg_open_key(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        )?;
+        assert_eq!(status, ERROR_SUCCESS);
+
+        // 4 bytes is guaranteed to be smaller than any REG_SZ ProductName.
+        let (query_status, reg_type, required_bytes, _buf) =
+            reg_query_value(hkey, "ProductName", vec![0u8; 4])?;
+        let _ = reg_close_key(hkey)?;
+        assert_eq!(query_status, ERROR_MORE_DATA);
+        assert_eq!(reg_type, REG_SZ);
+        assert!(
+            required_bytes > 4,
+            "lpcbData in/out slot should be rewritten with the required byte count \
+             (got {required_bytes})"
+        );
+        Ok(())
+    }
+
+    /// Corner case (size-query idiom): passing `lpData == NULL` with
+    /// `cb == 0` is the documented way to query the required size. This
+    /// specifically proves the null-pointer marshalling path.
+    #[test]
+    fn flat_call_reg_query_null_data_returns_size_query() -> Result<()> {
+        let (status, hkey) = reg_open_key(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        )?;
+        assert_eq!(status, ERROR_SUCCESS);
+
+        let (query_status, reg_type, required_bytes, _buf) =
+            reg_query_value(hkey, "ProductName", Vec::new())?;
+        let _ = reg_close_key(hkey)?;
+        // Win32 documents this "null data, 0 cb" path as returning
+        // ERROR_SUCCESS with the required size in cb_data.
+        assert_eq!(query_status, ERROR_SUCCESS);
+        assert_eq!(reg_type, REG_SZ);
+        assert!(required_bytes > 0);
         Ok(())
     }
 }

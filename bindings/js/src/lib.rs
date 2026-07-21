@@ -743,7 +743,8 @@ impl DynWinRTValue {
   /// `retKind` selects the return marshalling: `'I32' | 'U32' | 'Ptr'`.
   ///
   /// `args` may contain: `DynWinRtValue.i32(...)`, `DynWinRtValue.u32(...)`,
-  /// or `DynWinRtValue.pointer(...)`. Other kinds cause a runtime error.
+  /// `DynWinRtValue.i64(...)`, `DynWinRtValue.u64(...)`, or
+  /// `DynWinRtValue.pointer(...)`. Other kinds cause a runtime error.
   #[napi]
   pub fn flat_invoke(
     dll: String,
