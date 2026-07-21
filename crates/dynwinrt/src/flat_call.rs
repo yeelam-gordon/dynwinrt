@@ -84,7 +84,9 @@ pub enum FlatReturnKind {
 ///
 /// The caller must ensure that `dll`/`entry`, `ret`, and `args` exactly match
 /// the target export's ABI signature, and that all pointer arguments remain
-/// valid for the duration of the call.
+/// valid for the duration of the call. The DLL is unloaded before this function
+/// returns, so `FlatReturnKind::Ptr` may only be used for pointers or handles
+/// whose validity does not depend on that loaded module remaining resident.
 pub unsafe fn flat_invoke(
     dll: &str,
     entry: &str,
@@ -174,7 +176,7 @@ fn unsupported_platform_error() -> Error {
     )))
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows, target_pointer_width = "64"))]
 mod tests {
     use super::*;
 
