@@ -60,6 +60,10 @@ pub struct WideStringArg {
 }
 
 impl WideStringArg {
+    /// Returns a raw `LPCWSTR` pointer wrapped as a `WinRTValue`.
+    ///
+    /// The returned pointer is valid only while this `WideStringArg` is alive;
+    /// do not store or use the value after the owner is dropped.
     pub fn as_winrt_value(&self) -> WinRTValue {
         WinRTValue::RawPtr(self.buffer.as_ptr() as *mut c_void)
     }
@@ -95,6 +99,9 @@ pub enum FlatReturnKind {
 /// valid for the duration of the call. The DLL is unloaded before this function
 /// returns, so `FlatReturnKind::Ptr` may only be used for pointers or handles
 /// whose validity does not depend on that loaded module remaining resident.
+///
+/// `LoadLibraryW` uses the default DLL search order, so pass a trusted or
+/// fully qualified DLL path to avoid DLL preloading/hijacking risks.
 pub unsafe fn flat_invoke(
     dll: &str,
     entry: &str,
@@ -272,7 +279,10 @@ mod tests {
             FlatReturnKind::I32,
             &[],
         );
-        assert!(result.is_err());
+        let Err(Error::WindowsError(err)) = result else {
+            panic!("expected WindowsError for interior-NUL DLL name");
+        };
+        assert_eq!(err.code(), HRESULT(0x80070057u32 as i32));
     }
 
     #[test]
@@ -283,7 +293,10 @@ mod tests {
             FlatReturnKind::I32,
             &[],
         );
-        assert!(result.is_err());
+        let Err(Error::WindowsError(err)) = result else {
+            panic!("expected WindowsError for missing export");
+        };
+        assert_eq!(err.code(), HRESULT(0x8007007Fu32 as i32));
     }
 
     #[test]
