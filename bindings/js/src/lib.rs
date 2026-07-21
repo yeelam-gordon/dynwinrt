@@ -677,11 +677,32 @@ impl DynWinRTValue {
       )));
     }
 
-    // Fast path 2: BigInt → parse as u64 pointer bits
+    // Fast path 2: BigInt → parse as u64 pointer bits.
+    //
+    // BigInt::get_u64() returns (sign_bit, magnitude, lossless). The tuple
+    // silently swallows negative values (sign=true is dropped) and values
+    // that don't fit in u64 (lossless=false → magnitude wraps). Validate
+    // both so that DynWinRtValue.pointer(-1n) or a >2^64 bigint produce a
+    // clean error instead of a fabricated pointer.
     if val_type == sys::ValueType::napi_bigint {
       let bi =
         unsafe { napi::bindgen_prelude::BigInt::from_napi_value(raw_env, raw_val) }?;
-      let (_sign, n, _lossless) = bi.get_u64();
+      let (sign_bit, n, lossless) = bi.get_u64();
+      if sign_bit {
+        return Err(napi::Error::from_reason(
+          "pointer(): bigint must be non-negative (pointer values are unsigned)",
+        ));
+      }
+      if !lossless {
+        return Err(napi::Error::from_reason(
+          "pointer(): bigint exceeds u64 range; pointer values must fit in u64",
+        ));
+      }
+      if (n as usize as u64) != n {
+        return Err(napi::Error::from_reason(
+          "pointer(): bigint exceeds usize range on this platform",
+        ));
+      }
       return Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
         n as usize as *mut std::ffi::c_void,
       )));
@@ -858,13 +879,38 @@ impl DynWinRTValue {
   /// (existing WinRT codegen emits `DynWinRtValue.u64(value)` for `UInt64`
   /// params like stream seek/size). Accepting both keeps the WinRT path
   /// working while supporting the 64-bit classic-COM path.
+  ///
+  /// Negative values, values > u64::MAX (bigint), or negative numbers (JS
+  /// number) are rejected up front; silent truncation used to be possible
+  /// via BigInt::get_u64()'s sign/lossless flags and via `i64 as u64` on
+  /// the number path.
   #[napi(ts_args_type = "value: bigint | number")]
-  pub fn u64(value: Either<BigInt, i64>) -> DynWinRTValue {
+  pub fn u64(value: Either<BigInt, i64>) -> napi::Result<DynWinRTValue> {
     let n = match value {
-      Either::A(big) => big.get_u64().1,
-      Either::B(num) => num as u64,
+      Either::A(big) => {
+        let (sign_bit, n, lossless) = big.get_u64();
+        if sign_bit {
+          return Err(napi::Error::from_reason(
+            "u64(): bigint must be non-negative",
+          ));
+        }
+        if !lossless {
+          return Err(napi::Error::from_reason(
+            "u64(): bigint exceeds u64::MAX",
+          ));
+        }
+        n
+      }
+      Either::B(num) => {
+        if num < 0 {
+          return Err(napi::Error::from_reason(
+            "u64(): number must be non-negative; use bigint for the full u64 range",
+          ));
+        }
+        num as u64
+      }
     };
-    DynWinRTValue(dynwinrt::WinRTValue::U64(n))
+    Ok(DynWinRTValue(dynwinrt::WinRTValue::U64(n)))
   }
   #[napi]
   pub fn f32(value: f64) -> DynWinRTValue {

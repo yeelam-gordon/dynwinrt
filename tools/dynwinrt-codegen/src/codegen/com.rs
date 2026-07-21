@@ -149,33 +149,36 @@ fn method_is_interop_shape(m: &MethodMeta) -> Option<Vec<ParamMeta>> {
         Some(t) if is_hresult(t) => {}
         _ => return None,
     }
-    // Split params by direction.
-    let ins: Vec<&ParamMeta> = m
-        .params
-        .iter()
-        .filter(|p| p.direction == ParamDirection::In)
-        .collect();
-    let outs: Vec<&ParamMeta> = m
-        .params
-        .iter()
-        .filter(|p| p.direction == ParamDirection::Out)
-        .collect();
-    if ins.is_empty() {
+    // Enforce the exact structural shape in the ORIGINAL parameter order:
+    //   [in]... [in REFIID] [out void**]
+    // i.e. every param except the last is [in], the last is the sole [out],
+    // and the second-to-last [in] is the REFIID. Filtering into direction
+    // buckets would have lost this ordering and could misclassify methods
+    // where the [out] param appears mid-signature or where the REFIID is
+    // not at the tail of the in-list.
+    if m.params.len() < 2 {
         return None;
     }
-    if outs.len() != 1 {
+    let last_idx = m.params.len() - 1;
+    let out_param = &m.params[last_idx];
+    if out_param.direction != ParamDirection::Out {
         return None;
     }
-    // The last in-param must be a REFIID pointer. Accept both:
-    //   * TypeMeta::Guid (rare — some winmds project REFIID as System.Guid), or
-    //   * TypeMeta::Object with a parameter name of `riid`/`iid` (case-insensitive)
-    //     — the near-universal shape in Windows.Win32 metadata, where REFIID is
-    //     encoded as `Guid*` and falls through to `TypeMeta::Object`.
-    let last_in = ins.last().unwrap();
-    let is_riid = match &last_in.typ {
+    if !matches!(out_param.typ, TypeMeta::Object) {
+        return None;
+    }
+    // All preceding params must be [in].
+    for p in &m.params[..last_idx] {
+        if p.direction != ParamDirection::In {
+            return None;
+        }
+    }
+    // The last of those [in] params is the REFIID.
+    let riid = &m.params[last_idx - 1];
+    let is_riid = match &riid.typ {
         TypeMeta::Guid => true,
         TypeMeta::Object => {
-            let n = last_in.name.to_ascii_lowercase();
+            let n = riid.name.to_ascii_lowercase();
             n == "riid" || n == "iid"
         }
         _ => false,
@@ -183,12 +186,9 @@ fn method_is_interop_shape(m: &MethodMeta) -> Option<Vec<ParamMeta>> {
     if !is_riid {
         return None;
     }
-    // The out-param must be an Object (the void** out).
-    if !matches!(outs[0].typ, TypeMeta::Object) {
-        return None;
-    }
-    // Natural params: every in-param EXCEPT the trailing REFIID.
-    let natural: Vec<ParamMeta> = ins.iter().take(ins.len() - 1).map(|p| (*p).clone()).collect();
+    // Natural params: every [in] EXCEPT the trailing REFIID, preserving
+    // original order.
+    let natural: Vec<ParamMeta> = m.params[..last_idx - 1].iter().cloned().collect();
     Some(natural)
 }
 
