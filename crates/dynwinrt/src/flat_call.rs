@@ -258,7 +258,10 @@ mod tests {
     #[test]
     fn flat_call_nonexistent_dll_returns_error() {
         let result = invoke("no_such_dll_xyz.dll", "MulDiv", FlatReturnKind::I32, &[]);
-        assert!(result.is_err());
+        let Err(Error::WindowsError(err)) = result else {
+            panic!("expected WindowsError for missing DLL");
+        };
+        assert_eq!(err.code(), HRESULT(0x8007007Eu32 as i32));
     }
 
     #[test]
