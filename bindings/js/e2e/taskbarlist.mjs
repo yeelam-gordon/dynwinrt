@@ -83,5 +83,16 @@ try {
     fail(`SetProgressState(TBPF_NOPROGRESS) threw: ${e && e.message ? e.message : e}`);
 }
 
+// Prove the BOOL → i32 codegen fix: markFullscreenWindow historically emitted
+// `DynWinRtValue.pointer(fFullscreen)` and typed `fFullscreen: BOOL = bigint | Buffer`,
+// so passing a plain `false` threw at napi. After the fix, BOOL projects as an
+// i32 with a `boolean` surface, and this natural-JS call round-trips.
+console.log('[e2e] step 7: MarkFullscreenWindow(hwnd, false) — proves BOOL→i32 codegen fix');
+try {
+    t.markFullscreenWindow(hwndBig, false);
+} catch (e) {
+    fail(`MarkFullscreenWindow(hwnd, false) threw: ${e && e.message ? e.message : e}`);
+}
+
 console.log('PASS');
 process.exit(0);

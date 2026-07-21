@@ -130,7 +130,7 @@ fn param_type_mapping() {
             .unwrap();
 
     // Generate wrapper as a text bundle we can inspect for the mapping decisions
-    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD);
+    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD).expect("codegen must succeed for classic-COM interface");
 
     let dts = out.dts.as_str();
     let js = out.js.as_str();
@@ -186,7 +186,7 @@ fn partial_generation_only_emits_target_interface() {
     let com_iface =
         meta::parse_com_interface(WIN32_WINMD, "Windows.Win32.UI.Shell", "ITaskbarList3")
             .unwrap();
-    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD);
+    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD).expect("codegen must succeed for classic-COM interface");
 
     // Expected files: ITaskbarList3.js, ITaskbarList3.d.ts, TBPFLAG.js, TBPFLAG.d.ts
     let file_names: Vec<&str> = out.extra_files.iter().map(|(n, _)| n.as_str()).collect();
@@ -217,7 +217,7 @@ fn dts_surface_is_natural_and_clean() {
     let com_iface =
         meta::parse_com_interface(WIN32_WINMD, "Windows.Win32.UI.Shell", "ITaskbarList3")
             .unwrap();
-    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD);
+    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD).expect("codegen must succeed for classic-COM interface");
     let dts = out.dts.as_str();
 
     // PascalCase class name
@@ -276,7 +276,7 @@ fn js_body_uses_cocreateinstance_and_correct_slots() {
     let com_iface =
         meta::parse_com_interface(WIN32_WINMD, "Windows.Win32.UI.Shell", "ITaskbarList3")
             .unwrap();
-    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD);
+    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD).expect("codegen must succeed for classic-COM interface");
     let js = out.js.as_str();
 
     // CLSID + IID appear in .js
@@ -376,7 +376,7 @@ fn qi_only_interface_has_no_create() {
         "IPersist has no associated coclass CLSID"
     );
 
-    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD);
+    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD).expect("codegen must succeed for classic-COM interface");
     let js = out.js.as_str();
     let dts = out.dts.as_str();
 
@@ -413,12 +413,12 @@ fn generation_is_deterministic() {
     let a = {
         let com = meta::parse_com_interface(WIN32_WINMD, "Windows.Win32.UI.Shell", "ITaskbarList3")
             .unwrap();
-        com::generate_com_interface_files(&com, WIN32_WINMD)
+        com::generate_com_interface_files(&com, WIN32_WINMD).expect("codegen must succeed for classic-COM interface")
     };
     let b = {
         let com = meta::parse_com_interface(WIN32_WINMD, "Windows.Win32.UI.Shell", "ITaskbarList3")
             .unwrap();
-        com::generate_com_interface_files(&com, WIN32_WINMD)
+        com::generate_com_interface_files(&com, WIN32_WINMD).expect("codegen must succeed for classic-COM interface")
     };
     assert_eq!(a.js, b.js);
     assert_eq!(a.dts, b.dts);
@@ -446,7 +446,7 @@ fn snapshot_itaskbarlist3() {
     let com_iface =
         meta::parse_com_interface(WIN32_WINMD, "Windows.Win32.UI.Shell", "ITaskbarList3")
             .expect("ITaskbarList3 must exist");
-    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD);
+    let out = com::generate_com_interface_files(&com_iface, WIN32_WINMD).expect("codegen must succeed for classic-COM interface");
 
     let snapshot_dir: PathBuf =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/itaskbarlist3");

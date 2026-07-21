@@ -213,6 +213,40 @@ pub fn find_runtime_class_default_iid(
     None
 }
 
+/// Discover the NEWEST installed Windows SDK `Windows.winmd` by enumerating the
+/// versioned directories under `C:\Program Files (x86)\Windows Kits\10\UnionMetadata`
+/// and picking the highest version that actually contains a readable file.
+///
+/// Used as a portable fallback by the classic-COM interop code generator when
+/// the winmds explicitly loaded for generation don't contain the projected
+/// WinRT runtime class. Returns `None` when no SDK is installed.
+pub fn discover_newest_windows_winmd() -> Option<String> {
+    let base = std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\UnionMetadata");
+    if !base.exists() {
+        return None;
+    }
+    let mut versions: Vec<String> = std::fs::read_dir(base)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("10."))
+        .collect();
+    // Sort by dotted-version tuple so `10.0.26100.0` beats `10.0.19041.0`.
+    versions.sort_by(|a, b| {
+        let pa: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
+        let pb: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+        pa.cmp(&pb)
+    });
+    for version in versions.iter().rev() {
+        let winmd_path = base.join(version).join("Windows.winmd");
+        if winmd_path.exists() {
+            return Some(winmd_path.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 /// Parse all RuntimeClasses in a given namespace.
 pub fn parse_namespace(winmd_paths: &str, namespace: &str) -> Vec<ClassMeta> {
     let index = match load_index(winmd_paths) {

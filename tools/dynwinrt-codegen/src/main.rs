@@ -302,7 +302,8 @@ fn run() -> Result<(), String> {
                 // Emit classic-COM interfaces (standalone; not wired into WinRT index/barrel).
                 if !com_interfaces.is_empty() {
                     for com_iface in &com_interfaces {
-                        let out = com::generate_com_interface_files(com_iface, &winmd);
+                        let out = com::generate_com_interface_files(com_iface, &winmd)
+                            .map_err(|e| format!("Classic-COM codegen for {} failed: {}", com_iface.interface.name, e))?;
                         let js_name = format!("{}.js", com_iface.interface.name);
                         let dts_name = format!("{}.d.ts", com_iface.interface.name);
                         if !dry_run {

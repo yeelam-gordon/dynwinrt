@@ -13,7 +13,7 @@ const _ITaskbarList3 = new Proxy({}, {
             .addMethod('DeleteTab', new DynWinRtMethodSig().addIn(DynWinRtType.pointer()))
             .addMethod('ActivateTab', new DynWinRtMethodSig().addIn(DynWinRtType.pointer()))
             .addMethod('SetActiveAlt', new DynWinRtMethodSig().addIn(DynWinRtType.pointer()))
-            .addMethod('MarkFullscreenWindow', new DynWinRtMethodSig().addIn(DynWinRtType.pointer()).addIn(DynWinRtType.pointer()))
+            .addMethod('MarkFullscreenWindow', new DynWinRtMethodSig().addIn(DynWinRtType.pointer()).addIn(DynWinRtType.i32Type()))
             .addMethod('SetProgressValue', new DynWinRtMethodSig().addIn(DynWinRtType.pointer()).addIn(DynWinRtType.u64Type()).addIn(DynWinRtType.u64Type()))
             .addMethod('SetProgressState', new DynWinRtMethodSig().addIn(DynWinRtType.pointer()).addIn(DynWinRtType.i32Type()))
             .addMethod('RegisterTab', new DynWinRtMethodSig().addIn(DynWinRtType.pointer()).addIn(DynWinRtType.pointer()))
@@ -56,7 +56,7 @@ export class ITaskbarList3 {
         _ITaskbarList3.method(7).invoke(this._obj, [DynWinRtValue.pointer(hwnd)]);
     }
     markFullscreenWindow(hwnd, fFullscreen) {
-        _ITaskbarList3.method(8).invoke(this._obj, [DynWinRtValue.pointer(hwnd), DynWinRtValue.pointer(fFullscreen)]);
+        _ITaskbarList3.method(8).invoke(this._obj, [DynWinRtValue.pointer(hwnd), DynWinRtValue.i32(fFullscreen ? 1 : 0)]);
     }
     setProgressValue(hwnd, ullCompleted, ullTotal) {
         _ITaskbarList3.method(9).invoke(this._obj, [DynWinRtValue.pointer(hwnd), DynWinRtValue.u64(BigInt(ullCompleted)), DynWinRtValue.u64(BigInt(ullTotal))]);

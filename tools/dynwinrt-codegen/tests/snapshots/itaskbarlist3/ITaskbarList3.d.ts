@@ -2,8 +2,6 @@
 import { TBPFLAG } from './TBPFLAG.js';
 
 /** Opaque Win32 handle. Accepts either a raw pointer as `bigint` or a `Buffer`. */
-export type BOOL = bigint | Buffer;
-/** Opaque Win32 handle. Accepts either a raw pointer as `bigint` or a `Buffer`. */
 export type HICON = bigint | Buffer;
 /** Opaque Win32 handle. Accepts either a raw pointer as `bigint` or a `Buffer`. */
 export type HIMAGELIST = bigint | Buffer;
@@ -24,7 +22,7 @@ export declare class ITaskbarList3 {
     deleteTab(hwnd: HWND): void;
     activateTab(hwnd: HWND): void;
     setActiveAlt(hwnd: HWND): void;
-    markFullscreenWindow(hwnd: HWND, fFullscreen: BOOL): void;
+    markFullscreenWindow(hwnd: HWND, fFullscreen: boolean): void;
     setProgressValue(hwnd: HWND, ullCompleted: bigint, ullTotal: bigint): void;
     setProgressState(hwnd: HWND, tbpFlags: TBPFLAG): void;
     registerTab(tab: HWND, mDI: HWND): void;

@@ -41,21 +41,25 @@ pub struct ComGeneratedOutput {
 
 /// Generate the `.js` + `.d.ts` for a classic-COM interface.
 ///
-/// `winmd_paths` is retained (rather than removed) so that a follow-up phase
-/// can resolve additional deeply nested dependencies (structs, delegate
-/// interfaces) without a signature churn. For phase 1, only direct enum
-/// references discovered during `parse_com_interface` are emitted.
+/// `winmd_paths` is the semicolon-separated list of `.winmd` files loaded by
+/// the generator. Interop `*Interop` interfaces consult these winmds FIRST
+/// to resolve the projected WinRT runtime class's default IID; if that fails
+/// (e.g. the caller only passed Win32 metadata), the generator falls back to
+/// the NEWEST installed `UnionMetadata\<version>\Windows.winmd`. If the target
+/// IID still cannot be resolved for a confirmed interop shape, generation
+/// **fails loudly** with `Err(...)` — the generator must never emit a NULL
+/// riid that would silently break the wrapper at runtime.
 pub fn generate_com_interface_files(
     meta: &ComInterfaceMeta,
-    _winmd_paths: &str,
-) -> ComGeneratedOutput {
+    winmd_paths: &str,
+) -> Result<ComGeneratedOutput, String> {
     // Detect whether this is a `*Interop` interface whose every method has the
     // `(HWND, [HSTRING…,] REFIID, out void**)` GetForWindow shape. When so, we
     // emit natural signatures that hide the REFIID + void** — the caller only
     // supplies the natural in-params, and the wrapper returns the projected
     // WinRT object. We also emit a companion runtime-class file that provides
     // the ergonomic `<ClassName>.getForWindow(hwnd)` static surface.
-    let interop = detect_interop(meta);
+    let interop = detect_interop(meta, winmd_paths)?;
 
     let js = render_js(meta, interop.as_ref());
     let dts = render_dts(meta, interop.as_ref());
@@ -83,7 +87,7 @@ pub fn generate_com_interface_files(
 
     extra_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    ComGeneratedOutput { js, dts, extra_files }
+    Ok(ComGeneratedOutput { js, dts, extra_files })
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +134,15 @@ struct InteropInfo {
 }
 
 /// Recognise an interop method: last two ABI parameters are
-/// `(In: Object /* REFIID */, Out: Object /* void** */)`, HRESULT return.
+/// `(In: REFIID /* Guid* */, Out: Object /* void** */)`, HRESULT return.
+///
+/// The trailing in-param is treated as a hidden REFIID **only when we're
+/// confident it's actually one** — either its metadata type projects to
+/// `TypeMeta::Guid` (System.Guid) OR its parameter name (case-insensitive)
+/// is exactly `riid` / `iid`. A method whose last in-param is a real
+/// application-level Object (a live COM interface pointer) MUST NOT be
+/// interpreted as interop-shaped, since dropping that argument would silently
+/// break the wrapper. See Fix 3 in the accompanying code-review notes.
 fn method_is_interop_shape(m: &MethodMeta) -> Option<Vec<ParamMeta>> {
     // Must return HRESULT
     match &m.return_type {
@@ -154,9 +166,21 @@ fn method_is_interop_shape(m: &MethodMeta) -> Option<Vec<ParamMeta>> {
     if outs.len() != 1 {
         return None;
     }
-    // The last in-param must be an Object (the REFIID pointer).
+    // The last in-param must be a REFIID pointer. Accept both:
+    //   * TypeMeta::Guid (rare — some winmds project REFIID as System.Guid), or
+    //   * TypeMeta::Object with a parameter name of `riid`/`iid` (case-insensitive)
+    //     — the near-universal shape in Windows.Win32 metadata, where REFIID is
+    //     encoded as `Guid*` and falls through to `TypeMeta::Object`.
     let last_in = ins.last().unwrap();
-    if !matches!(last_in.typ, TypeMeta::Object) {
+    let is_riid = match &last_in.typ {
+        TypeMeta::Guid => true,
+        TypeMeta::Object => {
+            let n = last_in.name.to_ascii_lowercase();
+            n == "riid" || n == "iid"
+        }
+        _ => false,
+    };
+    if !is_riid {
         return None;
     }
     // The out-param must be an Object (the void** out).
@@ -174,13 +198,26 @@ fn method_is_interop_shape(m: &MethodMeta) -> Option<Vec<ParamMeta>> {
 ///
 /// Any interop-shape methods get natural signatures (hide riid + void**);
 /// the rest fall back to the normal classic-COM emission.
-fn detect_interop(meta: &ComInterfaceMeta) -> Option<InteropInfo> {
+///
+/// Returns:
+/// - `Ok(None)` — not an interop interface.
+/// - `Ok(Some(info))` — an interop interface with a resolved target IID.
+/// - `Err(msg)` — an interop interface was detected but the projected WinRT
+///   runtime class's default IID could not be resolved from either the
+///   passed winmds or the newest installed Windows SDK. This is a hard
+///   failure by design: silently emitting a NULL riid would produce a
+///   generated wrapper that fails only at runtime, on a machine the
+///   developer may not have.
+fn detect_interop(
+    meta: &ComInterfaceMeta,
+    winmd_paths: &str,
+) -> Result<Option<InteropInfo>, String> {
     let iface = &meta.interface;
     if !iface.name.ends_with("Interop") {
-        return None;
+        return Ok(None);
     }
     if iface.methods.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut methods = Vec::with_capacity(iface.methods.len());
     let mut has_interop_method = false;
@@ -210,7 +247,7 @@ fn detect_interop(meta: &ComInterfaceMeta) -> Option<InteropInfo> {
         }
     }
     if !has_interop_method {
-        return None;
+        return Ok(None);
     }
 
     // Derive the WinRT runtime-class simple name from the interop name:
@@ -221,30 +258,71 @@ fn detect_interop(meta: &ComInterfaceMeta) -> Option<InteropInfo> {
         .unwrap_or(stripped_i)
         .to_string();
 
-    // Auto-resolve the projected class's default interface IID from Windows.winmd.
-    let (class_namespace, target_iid) = match resolve_projected_default_iid(&class_name) {
+    // Auto-resolve the projected class's default interface IID. Try the winmds
+    // the generator was actually given FIRST (portable — respects an integrator
+    // who pinned a specific SDK via --ref); if that fails, discover the newest
+    // installed Windows SDK winmd. If BOTH fail, we cannot generate a working
+    // interop wrapper — fail loudly rather than emit a NULL riid.
+    let (class_namespace, target_iid) = match resolve_projected_default_iid(
+        winmd_paths,
+        &class_name,
+    ) {
         Some((ns, _iface_name, iid)) => (ns, iid),
-        None => (String::new(), String::new()),
+        None => {
+            return Err(format!(
+                "Classic-COM interop generator: cannot resolve default IID for the projected \
+                 WinRT runtime class `{cls}` (derived from `{iface}`). \
+                 Neither the winmds passed to the generator ({paths:?}) nor the newest installed \
+                 `C:\\Program Files (x86)\\Windows Kits\\10\\UnionMetadata\\<version>\\Windows.winmd` \
+                 contains a WinRT runtime class of that name with a resolvable default interface. \
+                 Pass the correct Windows.winmd via --ref or install a recent Windows SDK.",
+                cls = class_name,
+                iface = iface.name,
+                paths = winmd_paths,
+            ));
+        }
     };
 
-    Some(InteropInfo {
+    Ok(Some(InteropInfo {
         methods,
         class_name,
         class_namespace,
         target_iid,
-    })
+    }))
 }
 
-/// Auto-resolve the target class + IID for interop projection. Consults the
-/// well-known Windows.winmd path; returns `None` if unavailable or if the
-/// class doesn't exist / has no simple default interface IID.
-fn resolve_projected_default_iid(simple_class_name: &str) -> Option<(String, String, String)> {
-    const WELL_KNOWN_WINDOWS_WINMD: &str =
-        r"C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0\Windows.winmd";
-    if !std::path::Path::new(WELL_KNOWN_WINDOWS_WINMD).exists() {
+/// Auto-resolve the target class + IID for interop projection.
+///
+/// Consults, in order:
+///   1. The winmd paths currently loaded by the generator (`winmd_paths`).
+///   2. The NEWEST installed `Windows Kits\10\UnionMetadata\<version>\Windows.winmd`
+///      (dynamically discovered — NOT pinned to a specific SDK version).
+///
+/// Returns `None` when the class cannot be found in either source.
+fn resolve_projected_default_iid(
+    winmd_paths: &str,
+    simple_class_name: &str,
+) -> Option<(String, String, String)> {
+    // First: try the winmds the generator was given. When integrators pass
+    // pinned Windows metadata via --ref/--ref-list this preserves reproducibility.
+    if !winmd_paths.is_empty() {
+        if let Some(result) =
+            crate::meta::find_runtime_class_default_iid(winmd_paths, simple_class_name)
+        {
+            return Some(result);
+        }
+    }
+    // Fallback: newest installed SDK. This makes the generator portable across
+    // machines that have any recent SDK installed, not just `10.0.26100.0`.
+    let sdk_winmd = crate::meta::discover_newest_windows_winmd()?;
+    // Avoid re-loading if the SDK path was already among the passed winmds.
+    if winmd_paths
+        .split(';')
+        .any(|p| p.eq_ignore_ascii_case(&sdk_winmd))
+    {
         return None;
     }
-    crate::meta::find_runtime_class_default_iid(WELL_KNOWN_WINDOWS_WINMD, simple_class_name)
+    crate::meta::find_runtime_class_default_iid(&sdk_winmd, simple_class_name)
 }
 
 
@@ -855,6 +933,12 @@ fn enum_import_names(meta: &ComInterfaceMeta) -> Vec<String> {
 
 /// TS type expression for the `.d.ts` surface.
 fn ts_type_expr_dts(t: &TypeMeta) -> String {
+    // Win32 BOOL is a struct with a single `Value: I32` field — the same shape
+    // as an opaque handle. Special-case it to the natural boolean surface so
+    // callers can just pass `true`/`false` rather than a bigint.
+    if is_win32_bool(t) {
+        return "boolean".into();
+    }
     if let Some(h) = handle_type_name(t) {
         return h;
     }
@@ -874,6 +958,11 @@ fn ts_type_expr_dts(t: &TypeMeta) -> String {
 
 /// Runtime type expression for `DynWinRtMethodSig` calls in `.js`.
 fn ts_type_expr_js(t: &TypeMeta) -> String {
+    // Win32 BOOL marshals as a 32-bit int at the ABI (Win32 BOOL is `int`),
+    // NOT an opaque pointer. Mirrors how enums map to their underlying i32.
+    if is_win32_bool(t) {
+        return "DynWinRtType.i32Type()".into();
+    }
     if handle_type_name(t).is_some() {
         return "DynWinRtType.pointer()".into();
     }
@@ -898,6 +987,12 @@ fn ts_type_expr_js(t: &TypeMeta) -> String {
 }
 
 fn wrap_arg_js(t: &TypeMeta, var: &str) -> String {
+    // Win32 BOOL: accept `boolean`/`number`/`bigint` on the surface and
+    // narrow to an i32 (0/1) at the ABI. Truthy → 1, falsy → 0. Non-nullish
+    // numerics are preserved so callers passing `1`/`0` still work.
+    if is_win32_bool(t) {
+        return format!("DynWinRtValue.i32({var} ? 1 : 0)", var = var);
+    }
     if handle_type_name(t).is_some() {
         return format!("DynWinRtValue.pointer({var})", var = var);
     }
@@ -927,6 +1022,11 @@ fn wrap_arg_js(t: &TypeMeta, var: &str) -> String {
 /// PWSTR/PCWSTR/HRESULT-family types encountered as parameters (except
 /// HRESULT itself which is treated as `void`).
 fn handle_type_name(t: &TypeMeta) -> Option<String> {
+    // BOOL is NOT a handle even though it shape-matches (`{ Value: I32 }`).
+    // The natural surface is `boolean` (see `is_win32_bool`).
+    if is_win32_bool(t) {
+        return None;
+    }
     match t {
         TypeMeta::Struct { namespace, name, fields } => {
             if !is_win32_handle_namespace(namespace) {
@@ -969,6 +1069,18 @@ fn is_hresult(t: &TypeMeta) -> bool {
 
 fn is_hresult_by_name(ns: &str, name: &str) -> bool {
     ns == "Windows.Win32.Foundation" && name == "HRESULT"
+}
+
+/// Recognise the Win32 `BOOL` struct (`Windows.Win32.Foundation.BOOL`) — a
+/// `{ Value: I32 }` struct whose natural surface is a JS `boolean` but whose
+/// ABI is a 32-bit int. Kept as a distinct helper so the surface remains
+/// obvious and greppable.
+fn is_win32_bool(t: &TypeMeta) -> bool {
+    matches!(
+        t,
+        TypeMeta::Struct { namespace, name, .. }
+            if namespace == "Windows.Win32.Foundation" && name == "BOOL"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,5 +1249,304 @@ mod tests {
             ],
         };
         assert!(handle_type_name(&rect).is_none());
+    }
+
+    // ---- Fix 2 (BOOL → boolean/i32) ----
+
+    fn win32_bool_struct() -> TypeMeta {
+        TypeMeta::Struct {
+            namespace: "Windows.Win32.Foundation".into(),
+            name: "BOOL".into(),
+            fields: vec![crate::types::FieldMeta {
+                name: "Value".into(),
+                typ: TypeMeta::I32,
+            }],
+        }
+    }
+
+    #[test]
+    fn win32_bool_is_not_a_handle() {
+        let b = win32_bool_struct();
+        // Sanity: it's the exact shape of a handle (single Value: I32) — the
+        // special-case must WIN over the generic handle heuristic.
+        assert!(handle_type_name(&b).is_none(),
+            "BOOL must not be emitted as an opaque handle typedef");
+    }
+
+    #[test]
+    fn win32_bool_projects_as_boolean_and_i32() {
+        let b = win32_bool_struct();
+        // .d.ts surface: boolean (not `BOOL` or `bigint | Buffer`)
+        assert_eq!(ts_type_expr_dts(&b), "boolean");
+        // .js registration: i32 type (not pointer)
+        assert_eq!(ts_type_expr_js(&b), "DynWinRtType.i32Type()");
+        // .js argument marshalling: truthy→1, falsy→0 as an i32 (not pointer)
+        assert_eq!(
+            wrap_arg_js(&b, "fFullscreen"),
+            "DynWinRtValue.i32(fFullscreen ? 1 : 0)"
+        );
+    }
+
+    // ---- Fix 3 (REFIID-guarded interop heuristic) ----
+
+    /// Helper: construct a MethodMeta with HRESULT return type.
+    fn make_hresult() -> TypeMeta {
+        TypeMeta::Struct {
+            namespace: "Windows.Win32.Foundation".into(),
+            name: "HRESULT".into(),
+            fields: vec![crate::types::FieldMeta {
+                name: "Value".into(),
+                typ: TypeMeta::I32,
+            }],
+        }
+    }
+
+    #[test]
+    fn interop_shape_accepts_riid_named_object_trailing_in() {
+        // Real Windows.Win32 shape: `HRESULT GetForWindow(HWND appWindow, REFIID riid, out void** ppv)`.
+        // REFIID typically projects to TypeMeta::Object with name "riid".
+        let m = MethodMeta {
+            name: "GetForWindow".into(),
+            vtable_index: 3,
+            params: vec![
+                ParamMeta {
+                    name: "appWindow".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::In,
+                },
+                ParamMeta {
+                    name: "riid".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::In,
+                },
+                ParamMeta {
+                    name: "ppv".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::Out,
+                },
+            ],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        let natural = method_is_interop_shape(&m).expect(
+            "REFIID-shaped trailing in-param named `riid` must be recognised as interop",
+        );
+        // Natural in-params = every in EXCEPT the trailing REFIID.
+        assert_eq!(natural.len(), 1);
+        assert_eq!(natural[0].name, "appWindow");
+    }
+
+    #[test]
+    fn interop_shape_accepts_guid_typed_trailing_in() {
+        // Some winmds project REFIID as TypeMeta::Guid rather than Object.
+        let m = MethodMeta {
+            name: "GetSomething".into(),
+            vtable_index: 3,
+            params: vec![
+                ParamMeta {
+                    name: "target".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::In,
+                },
+                ParamMeta {
+                    // Deliberately NOT named "riid" — the type alone is sufficient.
+                    name: "interfaceId".into(),
+                    typ: TypeMeta::Guid,
+                    direction: ParamDirection::In,
+                },
+                ParamMeta {
+                    name: "out".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::Out,
+                },
+            ],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        let natural = method_is_interop_shape(&m)
+            .expect("System.Guid-typed trailing in-param must be recognised as interop");
+        assert_eq!(natural.len(), 1);
+        assert_eq!(natural[0].name, "target");
+    }
+
+    /// FIX 3 REGRESSION: a method returning HRESULT with an [out] Object and a
+    /// trailing In-Object whose name is NOT `riid`/`iid` (e.g. a real application
+    /// COM interface pointer like `original`) must NOT be mis-classified as
+    /// interop-shape. Otherwise the codegen would silently drop the caller's
+    /// meaningful argument.
+    #[test]
+    fn interop_shape_rejects_non_refiid_trailing_object() {
+        let m = MethodMeta {
+            name: "CloneWithOriginal".into(),
+            vtable_index: 3,
+            params: vec![
+                ParamMeta {
+                    name: "context".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::In,
+                },
+                ParamMeta {
+                    // NOT `riid`/`iid`, NOT Guid — a real COM pointer in-param.
+                    name: "original".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::In,
+                },
+                ParamMeta {
+                    name: "cloned".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::Out,
+                },
+            ],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        assert!(
+            method_is_interop_shape(&m).is_none(),
+            "trailing in-param `original` is a real Object argument, NOT a REFIID — \
+             it must not be dropped by the interop heuristic"
+        );
+    }
+
+    #[test]
+    fn interop_shape_rejects_iid_named_non_object_param() {
+        // A parameter named `riid` but typed as a plain I32 is not a REFIID —
+        // reject rather than silently drop.
+        let m = MethodMeta {
+            name: "Weird".into(),
+            vtable_index: 3,
+            params: vec![
+                ParamMeta {
+                    name: "hwnd".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::In,
+                },
+                ParamMeta {
+                    name: "riid".into(),
+                    typ: TypeMeta::I32,
+                    direction: ParamDirection::In,
+                },
+                ParamMeta {
+                    name: "out".into(),
+                    typ: TypeMeta::Object,
+                    direction: ParamDirection::Out,
+                },
+            ],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        assert!(
+            method_is_interop_shape(&m).is_none(),
+            "an I32 named `riid` is not a REFIID — must be rejected"
+        );
+    }
+
+    // ---- Fix 1 (winmd-derived interop IID, fail-loud on unresolved) ----
+
+    /// Build a fully synthetic ComInterfaceMeta for an `IFooInterop`-style
+    /// interface whose derived projected class name (`Foo`) does NOT exist
+    /// anywhere reachable. The generator must FAIL LOUDLY rather than emit
+    /// a NULL riid.
+    #[test]
+    fn interop_generation_fails_when_target_iid_unresolvable() {
+        use crate::meta::{ComInterfaceMeta, InterfaceMeta};
+
+        let iface = InterfaceMeta {
+            name: "IThisRuntimeClassDoesNotExist_DynWinrtInterop".into(),
+            namespace: "Windows.Win32.System.WinRT".into(),
+            iid: "00000000-0000-0000-0000-000000000000".into(),
+            methods: vec![MethodMeta {
+                name: "GetForWindow".into(),
+                vtable_index: 3,
+                params: vec![
+                    ParamMeta {
+                        name: "appWindow".into(),
+                        typ: TypeMeta::Object,
+                        direction: ParamDirection::In,
+                    },
+                    ParamMeta {
+                        name: "riid".into(),
+                        typ: TypeMeta::Object,
+                        direction: ParamDirection::In,
+                    },
+                    ParamMeta {
+                        name: "ppv".into(),
+                        typ: TypeMeta::Object,
+                        direction: ParamDirection::Out,
+                    },
+                ],
+                return_type: Some(make_hresult()),
+                ..Default::default()
+            }],
+            generic_piid: None,
+            generic_args: Vec::new(),
+            doc: None,
+            deprecated: None,
+        };
+        let com = ComInterfaceMeta {
+            interface: iface,
+            base_offset: 3,
+            is_iunknown_rooted: true,
+            base_chain: vec!["IUnknown".into()],
+            coclass_clsid: None,
+            coclass_name: None,
+            own_methods_start: 3,
+            referenced_enums: Vec::new(),
+        };
+        // Pass empty winmd_paths — even with the newest-SDK fallback, the
+        // synthetic class name won't be found anywhere.
+        let result = generate_com_interface_files(&com, "");
+        assert!(
+            result.is_err(),
+            "generator must fail loudly when the projected runtime-class IID \
+             cannot be resolved; got Ok(_)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ThisRuntimeClassDoesNotExist_Dynwinrt")
+                || err.contains("ThisRuntimeClassDoesNotExist_DynWinrt"),
+            "error must name the class it failed to resolve: {}",
+            err
+        );
+        assert!(
+            !err.is_empty(),
+            "error message must be non-empty (fail-loud contract)"
+        );
+    }
+
+    #[test]
+    fn non_interop_iunknown_interface_still_generates_without_winmd_lookup() {
+        // A vanilla IUnknown-rooted interface with no coclass and no
+        // interop shape must succeed even when we pass empty winmd paths.
+        use crate::meta::{ComInterfaceMeta, InterfaceMeta};
+        let iface = InterfaceMeta {
+            name: "IMyPlainClassicCom".into(),
+            namespace: "Windows.Win32.System.Com".into(),
+            iid: "11111111-2222-3333-4444-555555555555".into(),
+            methods: vec![MethodMeta {
+                name: "DoStuff".into(),
+                vtable_index: 3,
+                params: vec![],
+                return_type: Some(make_hresult()),
+                ..Default::default()
+            }],
+            generic_piid: None,
+            generic_args: Vec::new(),
+            doc: None,
+            deprecated: None,
+        };
+        let com = ComInterfaceMeta {
+            interface: iface,
+            base_offset: 3,
+            is_iunknown_rooted: true,
+            base_chain: vec!["IUnknown".into()],
+            coclass_clsid: None,
+            coclass_name: None,
+            own_methods_start: 3,
+            referenced_enums: Vec::new(),
+        };
+        let out = generate_com_interface_files(&com, "")
+            .expect("plain classic-COM codegen must succeed with no winmds");
+        assert!(out.js.contains("registerInterfaceUnknown"));
+        assert!(out.js.contains("method(3)"));
     }
 }
