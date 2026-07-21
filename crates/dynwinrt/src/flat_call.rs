@@ -10,26 +10,32 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_core::{HRESULT, HSTRING, PCSTR};
 
 use crate::{
-    metadata_table::TypeKind,
     result::{Error, Result},
     value::WinRTValue,
 };
 
-struct LoadedLibrary(HMODULE);
+struct LoadedLibrary {
+    module: HMODULE,
+    name: String,
+}
 
 impl LoadedLibrary {
     fn load(dll: &str) -> Result<Self> {
         unsafe { LoadLibraryW(&HSTRING::from(dll)) }
-            .map(Self)
+            .map(|module| Self {
+                module,
+                name: dll.to_string(),
+            })
             .map_err(Error::WindowsError)
     }
 
     fn proc_address(&self, entry: &str) -> Result<*mut c_void> {
-        let entry = CString::new(entry).map_err(|_| invalid_arg_error())?;
-        let proc = unsafe { GetProcAddress(self.0, PCSTR::from_raw(entry.as_ptr().cast())) };
+        let proc_name = CString::new(entry).map_err(|_| invalid_arg_error())?;
+        let proc =
+            unsafe { GetProcAddress(self.module, PCSTR::from_raw(proc_name.as_ptr().cast())) };
         match proc {
             Some(proc) => Ok(unsafe { std::mem::transmute(proc) }),
-            None => Err(Error::WindowsError(windows_core::Error::from_thread())),
+            None => Err(proc_not_found_error(&self.name, entry)),
         }
     }
 }
@@ -38,7 +44,7 @@ impl Drop for LoadedLibrary {
     fn drop(&mut self) {
         unsafe {
             let last_error = GetLastError();
-            let _ = FreeLibrary(self.0);
+            let _ = FreeLibrary(self.module);
             SetLastError(last_error);
         }
     }
@@ -72,7 +78,14 @@ pub enum FlatReturnKind {
     Ptr,
 }
 
-pub fn flat_invoke(
+/// Invokes a flat Win32 export through libffi.
+///
+/// # Safety
+///
+/// The caller must ensure that `dll`/`entry`, `ret`, and `args` exactly match
+/// the target export's ABI signature, and that all pointer arguments remain
+/// valid for the duration of the call.
+pub unsafe fn flat_invoke(
     dll: &str,
     entry: &str,
     ret: FlatReturnKind,
@@ -104,19 +117,17 @@ pub fn flat_invoke(
 
 fn flat_arg_type(value: &WinRTValue) -> Result<Type> {
     match value {
-        WinRTValue::RawPtr(_) | WinRTValue::Null => Ok(Type::pointer()),
+        WinRTValue::RawPtr(_) => Ok(Type::pointer()),
         WinRTValue::I32(_) => Ok(Type::i32()),
         WinRTValue::U32(_) => Ok(Type::u32()),
-        _ => Err(Error::InvalidType(TypeKind::I32, value.get_type_kind())),
+        _ => Err(invalid_arg_error()),
     }
 }
 
 fn flat_arg(value: &WinRTValue) -> Result<Arg<'_>> {
     match value {
-        WinRTValue::I32(_) | WinRTValue::U32(_) | WinRTValue::RawPtr(_) | WinRTValue::Null => {
-            Ok(value.libffi_arg())
-        }
-        _ => Err(Error::InvalidType(TypeKind::I32, value.get_type_kind())),
+        WinRTValue::I32(_) | WinRTValue::U32(_) | WinRTValue::RawPtr(_) => Ok(value.libffi_arg()),
+        _ => Err(invalid_arg_error()),
     }
 }
 
@@ -149,6 +160,13 @@ fn invalid_arg_error() -> Error {
     )))
 }
 
+fn proc_not_found_error(dll: &str, entry: &str) -> Error {
+    Error::WindowsError(windows_core::Error::new(
+        HRESULT(0x8007007Fu32 as i32),
+        format!("Export '{entry}' not found in '{dll}'"),
+    ))
+}
+
 #[cfg(not(all(windows, target_pointer_width = "64")))]
 fn unsupported_platform_error() -> Error {
     Error::WindowsError(windows_core::Error::from_hresult(HRESULT(
@@ -160,9 +178,18 @@ fn unsupported_platform_error() -> Error {
 mod tests {
     use super::*;
 
+    fn invoke(
+        dll: &str,
+        entry: &str,
+        ret: FlatReturnKind,
+        args: &[WinRTValue],
+    ) -> Result<WinRTValue> {
+        unsafe { flat_invoke(dll, entry, ret, args) }
+    }
+
     #[test]
     fn flat_call_mul_div_multiplies_divides_and_rounds() -> Result<()> {
-        let result = flat_invoke(
+        let result = invoke(
             "kernel32.dll",
             "MulDiv",
             FlatReturnKind::I32,
@@ -170,7 +197,7 @@ mod tests {
         )?;
         assert_eq!(result.as_i32(), Some(150));
 
-        let rounded = flat_invoke(
+        let rounded = invoke(
             "kernel32.dll",
             "MulDiv",
             FlatReturnKind::I32,
@@ -182,7 +209,7 @@ mod tests {
 
     #[test]
     fn flat_call_get_current_process_id_matches_rust_process_id() -> Result<()> {
-        let result = flat_invoke(
+        let result = invoke(
             "kernel32.dll",
             "GetCurrentProcessId",
             FlatReturnKind::U32,
@@ -198,7 +225,7 @@ mod tests {
     #[test]
     fn flat_call_lstrlenw_accepts_wide_string_pointer() -> Result<()> {
         let hello = wide_string_arg("hello");
-        let result = flat_invoke(
+        let result = invoke(
             "kernel32.dll",
             "lstrlenW",
             FlatReturnKind::I32,
@@ -207,7 +234,7 @@ mod tests {
         assert_eq!(result.as_i32(), Some(5));
 
         let empty = wide_string_arg("");
-        let result = flat_invoke(
+        let result = invoke(
             "kernel32.dll",
             "lstrlenW",
             FlatReturnKind::I32,
@@ -219,13 +246,13 @@ mod tests {
 
     #[test]
     fn flat_call_nonexistent_dll_returns_error() {
-        let result = flat_invoke("no_such_dll_xyz.dll", "MulDiv", FlatReturnKind::I32, &[]);
+        let result = invoke("no_such_dll_xyz.dll", "MulDiv", FlatReturnKind::I32, &[]);
         assert!(result.is_err());
     }
 
     #[test]
     fn flat_call_nonexistent_export_returns_error() {
-        let result = flat_invoke(
+        let result = invoke(
             "kernel32.dll",
             "ThisExportDoesNotExist",
             FlatReturnKind::I32,
@@ -237,7 +264,7 @@ mod tests {
     #[test]
     fn flat_call_get_module_handlew_uses_get_last_error_model() -> Result<()> {
         let bogus_module = wide_string_arg("no_such_module_xyz.dll");
-        let result = flat_invoke(
+        let result = invoke(
             "kernel32.dll",
             "GetModuleHandleW",
             FlatReturnKind::Ptr,
