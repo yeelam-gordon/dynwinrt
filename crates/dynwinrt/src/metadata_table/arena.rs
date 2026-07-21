@@ -122,16 +122,34 @@ impl MetadataTable {
 
     /// Create an interface method table with a specific base vtable slot.
     /// 6 = IInspectable-based (WinRT), 3 = IUnknown-based (classic COM).
+    ///
+    /// If a method table for this IID already exists, its `base_slot` MUST
+    /// match `base_slot`; otherwise subsequent method registrations for the
+    /// IID would compute wrong vtable indices for one of the callers.
+    /// Failing loudly is safer than silently keeping the first-registered
+    /// base slot (as `or_insert_with` would).
     pub(super) fn create_interface_method_table_with_base(&self, iid: GUID, base_slot: usize) {
-        self.interface_methods
-            .write()
-            .unwrap()
-            .entry(iid)
-            .or_insert_with(|| InterfaceMethodTable {
-                method_names: Vec::new(),
-                method_indices: Vec::new(),
-                base_slot,
-            });
+        let mut tables = self.interface_methods.write().unwrap();
+        match tables.entry(iid) {
+            std::collections::hash_map::Entry::Occupied(existing) => {
+                let existing_base = existing.get().base_slot;
+                assert_eq!(
+                    existing_base, base_slot,
+                    "interface IID {:?} registered twice with conflicting base slots \
+                     (existing={}, new={}). This would silently produce wrong vtable \
+                     indices; each IID must be registered with a single base_slot \
+                     (3 for IUnknown-based classic COM, 6 for IInspectable/WinRT).",
+                    iid, existing_base, base_slot,
+                );
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(InterfaceMethodTable {
+                    method_names: Vec::new(),
+                    method_indices: Vec::new(),
+                    base_slot,
+                });
+            }
+        }
     }
 
     /// Add a method to an interface's method table. Returns the vtable index.

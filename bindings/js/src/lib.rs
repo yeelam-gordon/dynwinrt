@@ -907,6 +907,16 @@ impl DynWinRTValue {
             "u64(): number must be non-negative; use bigint for the full u64 range",
           ));
         }
+        // JS Number can only faithfully represent integers up to 2^53 - 1;
+        // anything above that has already been rounded by the time napi
+        // converts to i64. Refuse it explicitly so callers switch to bigint
+        // instead of silently marshalling a lossy value.
+        const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991; // (1 << 53) - 1
+        if num > MAX_SAFE_INTEGER {
+          return Err(napi::Error::from_reason(
+            "u64(): number exceeds Number.MAX_SAFE_INTEGER; use bigint for the full u64 range",
+          ));
+        }
         num as u64
       }
     };
