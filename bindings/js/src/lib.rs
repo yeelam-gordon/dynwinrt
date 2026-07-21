@@ -314,7 +314,11 @@ impl DynWinRTType {
   }
 
   /// Add a method to this interface using a MethodSignature.
-  /// Methods are numbered starting at vtable index 6.
+  /// For IInspectable-based (WinRT) interfaces registered via
+  /// `register_interface`, methods start at vtable slot 6 (after
+  /// IUnknown 0-2 and IInspectable 3-5). For classic COM interfaces
+  /// registered via `register_interface_unknown`, methods start at
+  /// vtable slot 3 (after IUnknown 0-2 only).
   #[napi]
   pub fn add_method(&self, name: String, sig: &DynWinRTMethodSig) -> DynWinRTType {
     DynWinRTType(self.0.clone().add_method(&name, sig.0.clone()))
