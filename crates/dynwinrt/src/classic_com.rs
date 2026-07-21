@@ -126,9 +126,9 @@ mod tests {
 
     const CLSID_SHELL_LINK: GUID = GUID::from_u128(0x00021401_0000_0000_c000_000000000046);
     const IID_ISHELL_LINK_W: GUID = GUID::from_u128(0x000214f9_0000_0000_c000_000000000046);
+    const REGDB_E_CLASSNOTREG: windows_core::HRESULT = windows_core::HRESULT(0x80040154u32 as i32);
 
     fn shell_link() -> result::Result<WinRTValue> {
-        ensure_com_initialized()?;
         co_create_instance(CLSID_SHELL_LINK, IID_ISHELL_LINK_W)
     }
 
@@ -200,10 +200,13 @@ mod tests {
 
     #[test]
     fn co_create_instance_with_bogus_clsid_returns_error() -> result::Result<()> {
-        ensure_com_initialized()?;
         let bogus = GUID::from_u128(0xaaaaaaaa_bbbb_cccc_dddd_eeeeeeeeeeee);
 
-        assert!(co_create_instance(bogus, IID_ISHELL_LINK_W).is_err());
+        let err = co_create_instance(bogus, IID_ISHELL_LINK_W).unwrap_err();
+        match err {
+            result::Error::WindowsError(err) => assert_eq!(err.code(), REGDB_E_CLASSNOTREG),
+            err => panic!("expected REGDB_E_CLASSNOTREG, got {err:?}"),
+        }
         Ok(())
     }
 
