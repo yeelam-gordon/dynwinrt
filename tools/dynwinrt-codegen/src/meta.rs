@@ -156,6 +156,63 @@ pub fn parse_class(winmd_paths: &str, namespace: &str, name: &str) -> Option<Cla
     parse_class_from_index(&index, namespace, name)
 }
 
+/// Look up a WinRT runtime class in `winmd_paths` by simple (unqualified) name
+/// and return `(full_namespace, default_interface_name, default_interface_iid)`.
+///
+/// Used by the classic-COM `*Interop` codegen to auto-resolve the target type
+/// of a `GetForWindow(HWND, REFIID, out void**)` method: the interface prefix
+/// `I` and suffix `Interop` are stripped, and this helper finds the runtime
+/// class of that name in `Windows.winmd` (or any provided WinRT metadata).
+///
+/// Returns `None` when the winmd is unreadable, when no such class exists,
+/// when the class isn't marked `[WindowsRuntime]`, or when it has no default
+/// interface with a resolvable IID.
+pub fn find_runtime_class_default_iid(
+    winmd_paths: &str,
+    simple_name: &str,
+) -> Option<(String, String, String)> {
+    let index = load_index(winmd_paths)?;
+    // Iterate ALL TypeDefs looking for a runtime class matching `simple_name`.
+    for def in index.all() {
+        if def.name() != simple_name {
+            continue;
+        }
+        // A WinRT runtime class extends System.Object AND carries the
+        // WindowsRuntime flag on its type. Interfaces extend nothing;
+        // classes extend Object/etc. We filter to actual runtime classes.
+        if !def.flags().contains(windows_metadata::TypeAttributes::WindowsRuntime) {
+            continue;
+        }
+        // Must be a class (not interface/enum/struct).
+        if def.flags().contains(windows_metadata::TypeAttributes::Interface) {
+            continue;
+        }
+        let namespace = def.namespace().to_string();
+        // Look for the default interface via DefaultAttribute.
+        for iface_impl in def.interface_impls() {
+            if !iface_impl.has_attribute("DefaultAttribute") {
+                continue;
+            }
+            let iface_ty = iface_impl.interface(&[]);
+            let windows_metadata::Type::Name(tn) = &iface_ty else { continue };
+            // Resolve concrete (non-generic) interface's IID from its TypeDef.
+            if !tn.generics.is_empty() {
+                // Skip generic default interfaces — interop projections don't
+                // hit them in practice, and the parameterized IID would need
+                // separate computation.
+                continue;
+            }
+            let iface_def = index.get(&tn.namespace, &tn.name).next()?;
+            let iid = extract_iid(&iface_def);
+            if iid.is_empty() {
+                continue;
+            }
+            return Some((namespace, tn.name.clone(), iid));
+        }
+    }
+    None
+}
+
 /// Parse all RuntimeClasses in a given namespace.
 pub fn parse_namespace(winmd_paths: &str, namespace: &str) -> Vec<ClassMeta> {
     let index = match load_index(winmd_paths) {

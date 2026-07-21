@@ -586,6 +586,12 @@ impl DynWinRTValue {
 
   #[napi]
   pub fn activation_factory(name: String) -> napi::Result<DynWinRTValue> {
+    // WinRT's RoGetActivationFactory requires the thread apartment to be
+    // initialized. Node's main thread is not COM-initialized by default, so
+    // do it lazily on the first call (same behaviour as `coCreateInstance`).
+    dynwinrt::classic_com::ensure_com_initialized().map_err(|e| {
+      napi::Error::from_reason(format!("ensure_com_initialized: {}", e.message()))
+    })?;
     let factory = dynwinrt::ro_get_activation_factory_2(&HSTRING::from(&name)).map_err(|e| {
       napi::Error::from_reason(format!("ActivationFactory '{}': {}", name, e.message()))
     })?;
@@ -868,6 +874,29 @@ impl DynWinRTValue {
   #[napi]
   pub fn guid(value: &WinGUID) -> DynWinRTValue {
     DynWinRTValue(dynwinrt::WinRTValue::Guid(value.0))
+  }
+  /// Return a raw pointer to a stable GUID (for `REFIID` parameters).
+  /// The GUID is boxed and cached per-unique-value; the box outlives the process.
+  #[napi]
+  pub fn iid_pointer(value: &WinGUID) -> DynWinRTValue {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u128, usize>>> = OnceLock::new();
+    let g = value.0;
+    // Compose a stable u128 key from the GUID fields.
+    let mut key: u128 = 0;
+    key |= (g.data1 as u128) << 96;
+    key |= (g.data2 as u128) << 80;
+    key |= (g.data3 as u128) << 64;
+    for (i, b) in g.data4.iter().enumerate() {
+      key |= (*b as u128) << (56 - i as u32 * 8);
+    }
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    let addr = *map.entry(key).or_insert_with(|| {
+      Box::into_raw(Box::new(g)) as usize
+    });
+    DynWinRTValue(dynwinrt::WinRTValue::RawPtr(addr as *mut std::ffi::c_void))
   }
   #[napi]
   pub fn null_value() -> DynWinRTValue {

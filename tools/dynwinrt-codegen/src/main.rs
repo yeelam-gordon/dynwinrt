@@ -278,7 +278,12 @@ fn run() -> Result<(), String> {
                 let mut com_interfaces: Vec<meta::ComInterfaceMeta> = Vec::new();
                 for cls in &class_names {
                     if let Some(com_iface) = meta::parse_com_interface(&winmd, ns, cls) {
-                        if com_iface.is_iunknown_rooted {
+                        // Route through classic-COM path when:
+                        //   1) The interface is IUnknown-rooted (base +3), OR
+                        //   2) It is a `*Interop` bridge (name ends with "Interop") — even
+                        //      if IInspectable-rooted (base +6), because the emitter
+                        //      handles that via `registerInterface`.
+                        if com_iface.is_iunknown_rooted || cls.ends_with("Interop") {
                             com_interfaces.push(com_iface);
                             continue;
                         }
