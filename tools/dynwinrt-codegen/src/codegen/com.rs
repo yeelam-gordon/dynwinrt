@@ -49,8 +49,16 @@ pub fn generate_com_interface_files(
     meta: &ComInterfaceMeta,
     _winmd_paths: &str,
 ) -> ComGeneratedOutput {
-    let js = render_js(meta);
-    let dts = render_dts(meta);
+    // Detect whether this is a `*Interop` interface whose every method has the
+    // `(HWND, [HSTRING…,] REFIID, out void**)` GetForWindow shape. When so, we
+    // emit natural signatures that hide the REFIID + void** — the caller only
+    // supplies the natural in-params, and the wrapper returns the projected
+    // WinRT object. We also emit a companion runtime-class file that provides
+    // the ergonomic `<ClassName>.getForWindow(hwnd)` static surface.
+    let interop = detect_interop(meta);
+
+    let js = render_js(meta, interop.as_ref());
+    let dts = render_dts(meta, interop.as_ref());
 
     // Per-enum sibling files (referenced by parameter types).
     let mut extra_files: Vec<(String, String)> = Vec::new();
@@ -61,16 +69,190 @@ pub fn generate_com_interface_files(
             extra_files.push((format!("{}.d.ts", name), enum_dts));
         }
     }
+
+    // Companion projected-class files: only when the interop resolved to a
+    // real WinRT runtime class. This emits a natural `<ClassName>.js`/.d.ts
+    // with a static `getForWindow(hwnd)` and a `.runtimeClassName` getter,
+    // giving the E2E a MEANINGFUL surface to exercise on the returned object.
+    if let Some(ref info) = interop {
+        if let Some((cjs, cdts)) = render_projected_class_files(meta, info) {
+            extra_files.push((format!("{}.js", info.class_name), cjs));
+            extra_files.push((format!("{}.d.ts", info.class_name), cdts));
+        }
+    }
+
     extra_files.sort_by(|a, b| a.0.cmp(&b.0));
 
     ComGeneratedOutput { js, dts, extra_files }
 }
 
 // ---------------------------------------------------------------------------
+// Interop detection
+// ---------------------------------------------------------------------------
+
+/// Metadata for a single method within a `*Interop` interface. Each method
+/// is EITHER interop-shaped (`riid + void**` trailing pair to hide) OR plain
+/// (no special handling — HWND setter etc.).
+#[derive(Debug, Clone)]
+struct InteropMethod {
+    /// Original method name (PascalCase, e.g. "GetForWindow").
+    name: String,
+    /// camelCase method name for JS/TS emission.
+    camel: String,
+    /// Absolute vtable slot.
+    vtable_index: usize,
+    /// `Some(natural_params)` when the method has the interop shape (last two
+    /// ABI params are `(REFIID, out void**)`), i.e. the surface should hide
+    /// them. `None` means "plain" — emit like a normal classic-COM method.
+    natural_params: Option<Vec<ParamMeta>>,
+    /// For plain methods, the underlying `MethodMeta` so we can reuse the
+    /// existing emission path.
+    plain: Option<MethodMeta>,
+    /// Underlying method's docstring, if any.
+    _doc: Option<String>,
+}
+
+/// Interop-level metadata for the whole interface.
+#[derive(Debug, Clone)]
+struct InteropInfo {
+    /// Every method — some tagged interop-shape, some plain.
+    methods: Vec<InteropMethod>,
+    /// The projected WinRT runtime-class name (derived from the interop
+    /// interface: `ISystemMediaTransportControlsInterop` →
+    /// `SystemMediaTransportControls`).
+    class_name: String,
+    /// Full namespace of the projected runtime class in the WinRT metadata
+    /// (e.g. `"Windows.Media"`). Empty when auto-resolution failed.
+    class_namespace: String,
+    /// Default interface IID of the projected runtime class, used as the
+    /// REFIID in the interop call. Empty when auto-resolution failed.
+    target_iid: String,
+}
+
+/// Recognise an interop method: last two ABI parameters are
+/// `(In: Object /* REFIID */, Out: Object /* void** */)`, HRESULT return.
+fn method_is_interop_shape(m: &MethodMeta) -> Option<Vec<ParamMeta>> {
+    // Must return HRESULT
+    match &m.return_type {
+        Some(t) if is_hresult(t) => {}
+        _ => return None,
+    }
+    // Split params by direction.
+    let ins: Vec<&ParamMeta> = m
+        .params
+        .iter()
+        .filter(|p| p.direction == ParamDirection::In)
+        .collect();
+    let outs: Vec<&ParamMeta> = m
+        .params
+        .iter()
+        .filter(|p| p.direction == ParamDirection::Out)
+        .collect();
+    if ins.is_empty() {
+        return None;
+    }
+    if outs.len() != 1 {
+        return None;
+    }
+    // The last in-param must be an Object (the REFIID pointer).
+    let last_in = ins.last().unwrap();
+    if !matches!(last_in.typ, TypeMeta::Object) {
+        return None;
+    }
+    // The out-param must be an Object (the void** out).
+    if !matches!(outs[0].typ, TypeMeta::Object) {
+        return None;
+    }
+    // Natural params: every in-param EXCEPT the trailing REFIID.
+    let natural: Vec<ParamMeta> = ins.iter().take(ins.len() - 1).map(|p| (*p).clone()).collect();
+    Some(natural)
+}
+
+/// Best-effort detection: an interface qualifies as an "interop" iff
+/// (a) its name ends with `"Interop"`, and
+/// (b) at least ONE method matches the interop shape.
+///
+/// Any interop-shape methods get natural signatures (hide riid + void**);
+/// the rest fall back to the normal classic-COM emission.
+fn detect_interop(meta: &ComInterfaceMeta) -> Option<InteropInfo> {
+    let iface = &meta.interface;
+    if !iface.name.ends_with("Interop") {
+        return None;
+    }
+    if iface.methods.is_empty() {
+        return None;
+    }
+    let mut methods = Vec::with_capacity(iface.methods.len());
+    let mut has_interop_method = false;
+    for m in &iface.methods {
+        match method_is_interop_shape(m) {
+            Some(natural) => {
+                has_interop_method = true;
+                methods.push(InteropMethod {
+                    name: m.name.clone(),
+                    camel: camel_case(&m.name),
+                    vtable_index: m.vtable_index,
+                    natural_params: Some(natural),
+                    plain: None,
+                    _doc: m.doc.clone(),
+                });
+            }
+            None => {
+                methods.push(InteropMethod {
+                    name: m.name.clone(),
+                    camel: camel_case(&m.name),
+                    vtable_index: m.vtable_index,
+                    natural_params: None,
+                    plain: Some(m.clone()),
+                    _doc: m.doc.clone(),
+                });
+            }
+        }
+    }
+    if !has_interop_method {
+        return None;
+    }
+
+    // Derive the WinRT runtime-class simple name from the interop name:
+    // strip leading `I` and trailing `Interop`.
+    let stripped_i = iface.name.strip_prefix('I').unwrap_or(&iface.name);
+    let class_name = stripped_i
+        .strip_suffix("Interop")
+        .unwrap_or(stripped_i)
+        .to_string();
+
+    // Auto-resolve the projected class's default interface IID from Windows.winmd.
+    let (class_namespace, target_iid) = match resolve_projected_default_iid(&class_name) {
+        Some((ns, _iface_name, iid)) => (ns, iid),
+        None => (String::new(), String::new()),
+    };
+
+    Some(InteropInfo {
+        methods,
+        class_name,
+        class_namespace,
+        target_iid,
+    })
+}
+
+/// Auto-resolve the target class + IID for interop projection. Consults the
+/// well-known Windows.winmd path; returns `None` if unavailable or if the
+/// class doesn't exist / has no simple default interface IID.
+fn resolve_projected_default_iid(simple_class_name: &str) -> Option<(String, String, String)> {
+    const WELL_KNOWN_WINDOWS_WINMD: &str =
+        r"C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0\Windows.winmd";
+    if !std::path::Path::new(WELL_KNOWN_WINDOWS_WINMD).exists() {
+        return None;
+    }
+    crate::meta::find_runtime_class_default_iid(WELL_KNOWN_WINDOWS_WINMD, simple_class_name)
+}
+
+
+// ---------------------------------------------------------------------------
 // .js rendering
 // ---------------------------------------------------------------------------
 
-fn render_js(meta: &ComInterfaceMeta) -> String {
+fn render_js(meta: &ComInterfaceMeta, interop: Option<&InteropInfo>) -> String {
     let iface = &meta.interface;
     let iid = &iface.iid;
     let name = &iface.name;
@@ -83,6 +265,15 @@ fn render_js(meta: &ComInterfaceMeta) -> String {
     for en in enum_import_names(meta) {
         out.push_str(&format!("import {{ {} }} from './{}.js';\n", en, en));
     }
+    // Interop: import the projected class so we can wrap the returned object.
+    if let Some(info) = interop {
+        if !info.target_iid.is_empty() {
+            out.push_str(&format!(
+                "import {{ {cls} }} from './{cls}.js';\n",
+                cls = info.class_name
+            ));
+        }
+    }
     out.push('\n');
 
     out.push_str(&format!(
@@ -90,17 +281,36 @@ fn render_js(meta: &ComInterfaceMeta) -> String {
         name = name,
         iid = iid
     ));
+    // For interop wrappers with a resolved target IID, also emit the target
+    // interface IID as a private constant used by the getForWindow call.
+    if let Some(info) = interop {
+        if !info.target_iid.is_empty() {
+            out.push_str(&format!(
+                "const IID_{cls}_default = WinGuid.parse('{iid}');\n",
+                cls = info.class_name,
+                iid = info.target_iid,
+            ));
+        }
+    }
     out.push('\n');
 
-    // Interface registration (lazy)
+    // Interface registration (lazy). Base-aware: IUnknown-rooted uses
+    // registerInterfaceUnknown (first user slot = 3); IInspectable-rooted
+    // uses registerInterface (first user slot = 6).
+    let register_fn = if meta.is_iunknown_rooted {
+        "registerInterfaceUnknown"
+    } else {
+        "registerInterface"
+    };
     let cache_var = format!("_{name}Cache", name = name);
     let iface_var = format!("_{name}", name = name);
     out.push_str(&format!("let {cache_var};\n", cache_var = cache_var));
     out.push_str(&format!(
-        "const {iface_var} = new Proxy({{}}, {{\n    get(_target, prop) {{\n        {cache_var} ??= DynWinRtType.registerInterfaceUnknown('{name}', IID_{name})\n",
+        "const {iface_var} = new Proxy({{}}, {{\n    get(_target, prop) {{\n        {cache_var} ??= DynWinRtType.{register_fn}('{name}', IID_{name})\n",
         iface_var = iface_var,
         cache_var = cache_var,
         name = name,
+        register_fn = register_fn,
     ));
     for m in &iface.methods {
         out.push_str(&format!(
@@ -130,7 +340,7 @@ fn render_js(meta: &ComInterfaceMeta) -> String {
     ));
 
     if let Some(ref clsid) = meta.coclass_clsid {
-        // static create()
+        // static create() — classic COM CLSID-based activation.
         out.push_str(&format!(
             "    /** Create a new `{name}` via `CoCreateInstance` on `CLSID_{cc}`. */\n",
             name = name,
@@ -141,10 +351,33 @@ fn render_js(meta: &ComInterfaceMeta) -> String {
             clsid = clsid,
             name = name,
         ));
+    } else if let Some(info) = interop {
+        if !info.class_namespace.is_empty() {
+            // static create() — interop activation: activate the projected
+            // WinRT runtime class's factory, then QI to the interop IID.
+            let full_class_name = format!("{}.{}", info.class_namespace, info.class_name);
+            out.push_str(&format!(
+                "    /** Create a new `{name}` by activating the `{full_class_name}` factory and QI'ing to the interop. */\n",
+                name = name,
+                full_class_name = full_class_name,
+            ));
+            out.push_str(&format!(
+                "    static create() {{\n        const factory = DynWinRtValue.activationFactory('{full_class_name}');\n        const _obj = factory.cast(IID_{name});\n        return new {name}(_obj);\n    }}\n",
+                full_class_name = full_class_name,
+                name = name,
+            ));
+        }
     }
 
-    for m in &iface.methods {
-        emit_method_js(&mut out, m, &iface_var);
+    // Emit methods: natural interop shape when available, otherwise pass-through.
+    if let Some(info) = interop {
+        for im in &info.methods {
+            emit_interop_method_js(&mut out, im, &iface_var, info);
+        }
+    } else {
+        for m in &iface.methods {
+            emit_method_js(&mut out, m, &iface_var);
+        }
     }
     out.push_str("}\n");
     out
@@ -210,11 +443,72 @@ fn emit_method_js(out: &mut String, m: &MethodMeta, iface_var: &str) {
     out.push_str("    }\n");
 }
 
+/// Emit an interop method: either natural (hide trailing REFIID + void**) or
+/// plain (fall back to the normal classic-COM emission).
+fn emit_interop_method_js(out: &mut String, im: &InteropMethod, iface_var: &str, info: &InteropInfo) {
+    let Some(natural_params) = &im.natural_params else {
+        // Plain method — reuse the existing pass-through emission.
+        if let Some(m) = &im.plain {
+            emit_method_js(out, m, iface_var);
+        }
+        return;
+    };
+    let param_list: Vec<String> = natural_params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| js_param_name(&p.name, i))
+        .collect();
+
+    let mut arg_exprs: Vec<String> = natural_params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| wrap_arg_js(&p.typ, &js_param_name(&p.name, i)))
+        .collect();
+
+    // The synthesised REFIID pointer. When we have a resolved target IID we
+    // pass the cached pointer; otherwise the method is unusable (still emitted
+    // for completeness so `.d.ts` doesn't lie about the surface).
+    let riid_arg = if !info.target_iid.is_empty() {
+        format!("DynWinRtValue.iidPointer(IID_{}_default)", info.class_name)
+    } else {
+        "DynWinRtValue.pointer(0n)".to_string()
+    };
+    arg_exprs.push(riid_arg);
+
+    out.push_str(&format!(
+        "    {camel}({params}) {{\n",
+        camel = im.camel,
+        params = param_list.join(", "),
+    ));
+    if !info.target_iid.is_empty() {
+        out.push_str(&format!(
+            "        const _out = {iface_var}.method({slot}).invoke(this._obj, [{args}]);\n",
+            iface_var = iface_var,
+            slot = im.vtable_index,
+            args = arg_exprs.join(", "),
+        ));
+        out.push_str(&format!(
+            "        return {cls}._fromNative(_out);\n",
+            cls = info.class_name,
+        ));
+    } else {
+        // Fallback: no projection available. Return the raw object.
+        out.push_str(&format!(
+            "        return {iface_var}.method({slot}).invoke(this._obj, [{args}]);\n",
+            iface_var = iface_var,
+            slot = im.vtable_index,
+            args = arg_exprs.join(", "),
+        ));
+    }
+    out.push_str("    }\n");
+}
+
+
 // ---------------------------------------------------------------------------
 // .d.ts rendering
 // ---------------------------------------------------------------------------
 
-fn render_dts(meta: &ComInterfaceMeta) -> String {
+fn render_dts(meta: &ComInterfaceMeta, interop: Option<&InteropInfo>) -> String {
     let iface = &meta.interface;
     let name = &iface.name;
 
@@ -224,6 +518,15 @@ fn render_dts(meta: &ComInterfaceMeta) -> String {
     // Node.js `Buffer` is a global type; no import needed. We DO import enum types.
     for en in enum_import_names(meta) {
         out.push_str(&format!("import {{ {} }} from './{}.js';\n", en, en));
+    }
+    // Interop: import the projected class declaration so return types resolve.
+    if let Some(info) = interop {
+        if !info.target_iid.is_empty() {
+            out.push_str(&format!(
+                "import {{ {cls} }} from './{cls}.js';\n",
+                cls = info.class_name
+            ));
+        }
     }
     out.push('\n');
 
@@ -245,41 +548,253 @@ fn render_dts(meta: &ComInterfaceMeta) -> String {
     if meta.coclass_clsid.is_some() {
         out.push_str("    /** Create a new instance via the coclass activation path. */\n");
         out.push_str(&format!("    static create(): {name};\n", name = name));
+    } else if let Some(info) = interop {
+        if !info.class_namespace.is_empty() {
+            out.push_str(&format!(
+                "    /** Activate the projected WinRT class and QI to the interop. */\n    static create(): {name};\n",
+                name = name
+            ));
+        }
     }
     out.push_str(&format!(
         "    /** Wrap an existing native COM pointer (for QueryInterface bridging). */\n    static _fromNative(obj: unknown): {name};\n",
         name = name
     ));
 
-    for m in &iface.methods {
-        let camel = camel_case(&m.name);
-        let in_params: Vec<&ParamMeta> = m
-            .params
-            .iter()
-            .filter(|p| p.direction == ParamDirection::In)
-            .collect();
-        let ts_params: Vec<String> = in_params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                format!("{}: {}", js_param_name(&p.name, i), ts_type_expr_dts(&p.typ))
-            })
-            .collect();
-        let ret = match &m.return_type {
-            None => "void".to_string(),
-            Some(t) if is_hresult(t) => "void".to_string(),
-            Some(t) => ts_type_expr_dts(t),
-        };
-        out.push_str(&format!(
-            "    {camel}({params}): {ret};\n",
-            camel = camel,
-            params = ts_params.join(", "),
-            ret = ret,
-        ));
+    if let Some(info) = interop {
+        // Interop methods: NATURAL signatures for interop-shape methods (no
+        // riid, no void**). Plain methods fall through to the normal
+        // classic-COM emission.
+        for im in &info.methods {
+            match (&im.natural_params, &im.plain) {
+                (Some(natural), _) => {
+                    let ts_params: Vec<String> = natural
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            format!("{}: {}", js_param_name(&p.name, i), ts_type_expr_dts(&p.typ))
+                        })
+                        .collect();
+                    let ret = if !info.target_iid.is_empty() {
+                        info.class_name.clone()
+                    } else {
+                        "unknown".to_string()
+                    };
+                    out.push_str(&format!(
+                        "    {camel}({params}): {ret};\n",
+                        camel = im.camel,
+                        params = ts_params.join(", "),
+                        ret = ret,
+                    ));
+                }
+                (None, Some(m)) => {
+                    let camel = camel_case(&m.name);
+                    let in_params: Vec<&ParamMeta> = m
+                        .params
+                        .iter()
+                        .filter(|p| p.direction == ParamDirection::In)
+                        .collect();
+                    let ts_params: Vec<String> = in_params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            format!("{}: {}", js_param_name(&p.name, i), ts_type_expr_dts(&p.typ))
+                        })
+                        .collect();
+                    let ret = match &m.return_type {
+                        None => "void".to_string(),
+                        Some(t) if is_hresult(t) => "void".to_string(),
+                        Some(t) => ts_type_expr_dts(t),
+                    };
+                    out.push_str(&format!(
+                        "    {camel}({params}): {ret};\n",
+                        camel = camel,
+                        params = ts_params.join(", "),
+                        ret = ret,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    } else {
+        for m in &iface.methods {
+            let camel = camel_case(&m.name);
+            let in_params: Vec<&ParamMeta> = m
+                .params
+                .iter()
+                .filter(|p| p.direction == ParamDirection::In)
+                .collect();
+            let ts_params: Vec<String> = in_params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    format!("{}: {}", js_param_name(&p.name, i), ts_type_expr_dts(&p.typ))
+                })
+                .collect();
+            let ret = match &m.return_type {
+                None => "void".to_string(),
+                Some(t) if is_hresult(t) => "void".to_string(),
+                Some(t) => ts_type_expr_dts(t),
+            };
+            out.push_str(&format!(
+                "    {camel}({params}): {ret};\n",
+                camel = camel,
+                params = ts_params.join(", "),
+                ret = ret,
+            ));
+        }
     }
     out.push_str("}\n");
     out
 }
+
+/// Emit the companion `<ClassName>.js` + `.d.ts` for the projected WinRT
+/// runtime class. Provides:
+/// - a `static getForWindow(hwnd)` that opens the interop and calls it,
+///   returning a natural `<ClassName>` wrapper;
+/// - an internal constructor that stores the live COM object;
+/// - a `runtimeClassName` getter (via IInspectable::GetRuntimeClassName) —
+///   the E2E's proof that the returned object is a live WinRT instance.
+fn render_projected_class_files(
+    meta: &ComInterfaceMeta,
+    info: &InteropInfo,
+) -> Option<(String, String)> {
+    if info.target_iid.is_empty() || info.class_namespace.is_empty() {
+        return None;
+    }
+    // The interop wrapper file is named after the interface (e.g.
+    // `IDataTransferManagerInterop.js`). We import from it.
+    let interop_module = &meta.interface.name;
+    let full_class_name = format!("{}.{}", info.class_namespace, info.class_name);
+
+    // Pick the primary interop method to expose as the `static getForWindow`.
+    // Prefer one whose PascalCase name equals "GetForWindow"; otherwise take
+    // the first interop-shape method.
+    let primary = info
+        .methods
+        .iter()
+        .find(|im| im.name == "GetForWindow" && im.natural_params.is_some())
+        .or_else(|| info.methods.iter().find(|im| im.natural_params.is_some()))?;
+    let primary_natural = primary.natural_params.as_ref()?;
+
+    // The IInspectable IID is a fixed WinRT constant.
+    const IID_IINSPECTABLE: &str = "af86e2e0-b12d-4c6a-9c5a-d7aa65101e90";
+
+    // -- .js --
+    let mut js = String::new();
+    js.push_str("// Generated by dynwinrt-codegen — do not edit\n");
+    js.push_str("import { DynWinRtType, DynWinRtMethodSig, WinGuid } from '@microsoft/dynwinrt';\n");
+    js.push_str(&format!(
+        "import {{ {interop} }} from './{interop}.js';\n",
+        interop = interop_module,
+    ));
+    js.push('\n');
+
+    js.push_str(&format!(
+        "const IID_IInspectable = WinGuid.parse('{iid}');\n\n",
+        iid = IID_IINSPECTABLE
+    ));
+    // IInspectable registration (lazy) — used to reach GetRuntimeClassName.
+    // IInspectable is the base itself; its methods live at absolute vtable
+    // slots 3, 4, 5 (right after IUnknown). Register with the +3 base so that
+    // `.method(4)` resolves to `GetRuntimeClassName` at the real absolute slot.
+    js.push_str("let _IInspectableCache;\n");
+    js.push_str("const _IInspectable = new Proxy({}, {\n    get(_target, prop) {\n");
+    js.push_str("        _IInspectableCache ??= DynWinRtType.registerInterfaceUnknown('IInspectable_projected', IID_IInspectable)\n");
+    js.push_str("            .addMethod('GetIids', new DynWinRtMethodSig().addOut(DynWinRtType.pointer()).addOut(DynWinRtType.pointer()))\n");
+    js.push_str("            .addMethod('GetRuntimeClassName', new DynWinRtMethodSig().addOut(DynWinRtType.hstring()))\n");
+    js.push_str("            .addMethod('GetTrustLevel', new DynWinRtMethodSig().addOut(DynWinRtType.i32Type()));\n");
+    js.push_str("        const value = _IInspectableCache[prop];\n");
+    js.push_str("        return typeof value === 'function' ? value.bind(_IInspectableCache) : value;\n");
+    js.push_str("    },\n});\n\n");
+
+    js.push_str(&format!("export class {cls} {{\n", cls = info.class_name));
+    js.push_str("    _obj;\n");
+    js.push_str("    constructor(obj) { this._obj = obj; }\n");
+    js.push_str(&format!(
+        "    static _fromNative(obj) {{ return new {cls}(obj); }}\n",
+        cls = info.class_name,
+    ));
+
+    // Static getForWindow(hwnd) — the high-level natural surface.
+    let param_list: Vec<String> = primary_natural
+        .iter()
+        .enumerate()
+        .map(|(i, p)| js_param_name(&p.name, i))
+        .collect();
+    js.push_str(&format!(
+        "    /** Get a `{cls}` for the given HWND via the {interop} interop. */\n",
+        cls = info.class_name,
+        interop = interop_module,
+    ));
+    js.push_str(&format!(
+        "    static {camel}({params}) {{\n",
+        camel = primary.camel,
+        params = param_list.join(", "),
+    ));
+    js.push_str(&format!(
+        "        const interop = {interop}.create();\n",
+        interop = interop_module,
+    ));
+    // Call interop.<camelMethod>(...naturalArgs) — this returns a
+    // `<ClassName>` already wrapped via `_fromNative`.
+    js.push_str(&format!(
+        "        return interop.{camel}({params});\n",
+        camel = primary.camel,
+        params = param_list.join(", "),
+    ));
+    js.push_str("    }\n");
+
+    // runtimeClassName getter — IInspectable slot 4 (absolute vtable index).
+    js.push_str("    /** IInspectable::GetRuntimeClassName — the projected class name. */\n");
+    js.push_str("    get runtimeClassName() {\n");
+    js.push_str("        return _IInspectable.method(4).getString(this._obj);\n");
+    js.push_str("    }\n");
+
+    js.push_str("}\n");
+
+    // -- .d.ts --
+    let mut dts = String::new();
+    dts.push_str("// Generated by dynwinrt-codegen — do not edit\n\n");
+    // Handle typedef for HWND (needed for the static getForWindow signature).
+    let handle_aliases = collect_handle_aliases(meta);
+    for h in &handle_aliases {
+        dts.push_str(&format!(
+            "/** Opaque Win32 handle. Accepts either a raw pointer as `bigint` or a `Buffer`. */\nexport type {h} = bigint | Buffer;\n",
+            h = h
+        ));
+    }
+    if !handle_aliases.is_empty() {
+        dts.push('\n');
+    }
+    dts.push_str(&format!("export declare class {cls} {{\n", cls = info.class_name));
+    dts.push_str(&format!(
+        "    /** Wrap an existing native COM pointer (for QueryInterface bridging). */\n    static _fromNative(obj: unknown): {cls};\n",
+        cls = info.class_name,
+    ));
+    let ts_params: Vec<String> = primary_natural
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{}: {}", js_param_name(&p.name, i), ts_type_expr_dts(&p.typ)))
+        .collect();
+    dts.push_str(&format!(
+        "    /** Get a `{cls}` for the given HWND (projected from `{full_class_name}`). */\n",
+        cls = info.class_name,
+        full_class_name = full_class_name,
+    ));
+    dts.push_str(&format!(
+        "    static {camel}({params}): {cls};\n",
+        camel = primary.camel,
+        params = ts_params.join(", "),
+        cls = info.class_name,
+    ));
+    dts.push_str("    /** IInspectable::GetRuntimeClassName — the projected class name. */\n");
+    dts.push_str("    get runtimeClassName(): string;\n");
+    dts.push_str("}\n");
+
+    Some((js, dts))
+}
+
 
 fn collect_handle_aliases(meta: &ComInterfaceMeta) -> Vec<String> {
     let mut set = BTreeSet::new();
