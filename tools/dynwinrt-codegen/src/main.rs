@@ -7,6 +7,7 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
+use dynwinrt_codegen::codegen::com;
 use dynwinrt_codegen::codegen::python;
 use dynwinrt_codegen::codegen::render_package_json;
 use dynwinrt_codegen::codegen::typescript;
@@ -268,16 +269,64 @@ fn run() -> Result<(), String> {
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                     .collect();
+
+                // First: partition into WinRT classes and classic-COM interfaces.
+                // Prefer classic-COM ONLY when the found type is actually IUnknown-rooted
+                // (`is_iunknown_rooted == true`). IInspectable-rooted WinRT interfaces and
+                // WinRT runtime classes stay on the existing `parse_class`/WinRT pipeline.
                 let mut classes = Vec::new();
+                let mut com_interfaces: Vec<meta::ComInterfaceMeta> = Vec::new();
                 for cls in &class_names {
+                    if let Some(com_iface) = meta::parse_com_interface(&winmd, ns, cls) {
+                        if com_iface.is_iunknown_rooted {
+                            com_interfaces.push(com_iface);
+                            continue;
+                        }
+                    }
                     match meta::parse_class(&winmd, ns, cls) {
                         Some(mut c) => {
                             doc_table.apply_to_class(&mut c);
                             classes.push(c);
                         }
-                        None => return Err(format!("Class {}.{} not found in {}", ns, cls, winmd)),
+                        None => {
+                            return Err(format!("Class {}.{} not found in {}", ns, cls, winmd));
+                        }
                     }
                 }
+
+                // Emit classic-COM interfaces (standalone; not wired into WinRT index/barrel).
+                if !com_interfaces.is_empty() {
+                    for com_iface in &com_interfaces {
+                        let out = com::generate_com_interface_files(com_iface, &winmd);
+                        let js_name = format!("{}.js", com_iface.interface.name);
+                        let dts_name = format!("{}.d.ts", com_iface.interface.name);
+                        if !dry_run {
+                            fs::write(output_dir.join(&js_name), &out.js).map_err(|e| {
+                                format!("Failed to write {}: {}", js_name, e)
+                            })?;
+                            fs::write(output_dir.join(&dts_name), &out.dts).map_err(|e| {
+                                format!("Failed to write {}: {}", dts_name, e)
+                            })?;
+                            for (name, content) in &out.extra_files {
+                                fs::write(output_dir.join(name), content).map_err(|e| {
+                                    format!("Failed to write {}: {}", name, e)
+                                })?;
+                            }
+                            println!("Generated {} ({} .js/.d.ts + {} extras)",
+                                com_iface.interface.name,
+                                2,
+                                out.extra_files.len());
+                        } else {
+                            println!("[dry-run] Would generate {}", com_iface.interface.name);
+                        }
+                    }
+                    // If we only had classic-COM interfaces requested, return early —
+                    // no WinRT index/barrel work to do.
+                    if classes.is_empty() {
+                        return Ok(());
+                    }
+                }
+
                 add_implicit_js_types(&winmd, &lang, &mut classes);
                 generate_for_types(
                     &winmd,
