@@ -980,7 +980,7 @@ fn ts_type_expr_js(t: &TypeMeta) -> String {
         TypeMeta::F64 => "DynWinRtType.f64Type()".into(),
         TypeMeta::Char16 => "DynWinRtType.char16()".into(),
         TypeMeta::String => "DynWinRtType.pointer()".into(), // PCWSTR/PWSTR → opaque
-        TypeMeta::Guid => "DynWinRtType.guid()".into(),
+        TypeMeta::Guid => "DynWinRtType.guidType()".into(),
         TypeMeta::Enum { underlying, .. } => ts_type_expr_js(underlying),
         _ => "DynWinRtType.pointer()".into(),
     }
@@ -1010,7 +1010,7 @@ fn wrap_arg_js(t: &TypeMeta, var: &str) -> String {
         TypeMeta::F64 => format!("DynWinRtValue.f64({var})", var = var),
         TypeMeta::Char16 => format!("DynWinRtValue.char16({var})", var = var),
         TypeMeta::String => format!("DynWinRtValue.pointer({var})", var = var),
-        TypeMeta::Guid => format!("DynWinRtValue.guid({var})", var = var),
+        TypeMeta::Guid => format!("DynWinRtValue.guid(WinGuid.parse({var}))", var = var),
         TypeMeta::Enum { underlying, .. } => wrap_arg_js(underlying, var),
         _ => format!("DynWinRtValue.pointer({var})", var = var),
     }
