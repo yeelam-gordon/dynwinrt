@@ -2,9 +2,10 @@
 // Licensed under the MIT License.
 
 use core::ffi::c_void;
+use std::cell::RefCell;
 
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows_core::{GUID, IUnknown, Interface};
 
@@ -12,15 +13,44 @@ use crate::{MethodSignature, WinRTValue, result};
 
 const RPC_E_CHANGED_MODE: windows_core::HRESULT = windows_core::HRESULT(0x80010106u32 as i32);
 
-pub fn ensure_com_initialized() -> result::Result<()> {
-    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    if hr.is_ok() || hr == RPC_E_CHANGED_MODE {
-        Ok(())
-    } else {
-        Err(result::Error::WindowsError(
-            windows_core::Error::from_hresult(hr),
-        ))
+struct ComApartment;
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
     }
+}
+
+enum ComInitialization {
+    Unknown,
+    Owned(ComApartment),
+    ExistingApartment,
+}
+
+thread_local! {
+    static COM_INITIALIZATION: RefCell<ComInitialization> =
+        const { RefCell::new(ComInitialization::Unknown) };
+}
+
+pub fn ensure_com_initialized() -> result::Result<()> {
+    COM_INITIALIZATION.with(|state| {
+        if !matches!(*state.borrow(), ComInitialization::Unknown) {
+            return Ok(());
+        }
+
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr.is_ok() {
+            *state.borrow_mut() = ComInitialization::Owned(ComApartment);
+            Ok(())
+        } else if hr == RPC_E_CHANGED_MODE {
+            *state.borrow_mut() = ComInitialization::ExistingApartment;
+            Ok(())
+        } else {
+            Err(result::Error::WindowsError(
+                windows_core::Error::from_hresult(hr),
+            ))
+        }
+    })
 }
 
 pub fn co_create_instance(clsid: GUID, iid: GUID) -> result::Result<WinRTValue> {
@@ -87,8 +117,7 @@ pub fn wide_to_string(buffer: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InterfaceSignature, MetadataTable, MethodSignature};
-    use windows_core::Interface;
+    use crate::{InterfaceSignature, MetadataTable, com_helpers::E_NOINTERFACE};
 
     const CLSID_SHELL_LINK: GUID = GUID::from_u128(0x00021401_0000_0000_c000_000000000046);
     const IID_ISHELL_LINK_W: GUID = GUID::from_u128(0x000214f9_0000_0000_c000_000000000046);
@@ -178,7 +207,11 @@ mod tests {
         let shell_link = shell_link()?;
         let bogus = GUID::from_u128(0xbbbbbbbb_cccc_dddd_eeee_ffffffffffff);
 
-        assert!(shell_link.cast(&bogus).is_err());
+        let err = shell_link.cast(&bogus).unwrap_err();
+        match err {
+            result::Error::WindowsError(err) => assert_eq!(err.code(), E_NOINTERFACE),
+            err => panic!("expected E_NOINTERFACE, got {err:?}"),
+        }
         Ok(())
     }
 }
