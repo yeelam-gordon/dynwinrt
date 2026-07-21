@@ -19,11 +19,17 @@ use dynwinrt_codegen::codegen::com;
 use dynwinrt_codegen::meta;
 
 const WIN32_WINMD: &str = r"C:\s\win32metadata\Windows.Win32.winmd";
-const WINDOWS_WINMD: &str =
-    r"C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0\Windows.winmd";
 
 fn win32_available() -> bool {
     Path::new(WIN32_WINMD).exists()
+}
+
+/// Resolve a `Windows.winmd` from the newest installed Windows SDK, matching
+/// the discovery logic the codegen itself uses. Returns `None` if no SDK is
+/// installed on this machine (the test that calls this should skip in that
+/// case, consistent with other tests in this module).
+fn discovered_windows_winmd() -> Option<String> {
+    meta::discover_newest_windows_winmd()
 }
 
 // -------------------------------------------------------------------------
@@ -324,12 +330,12 @@ fn js_body_uses_cocreateinstance_and_correct_slots() {
 fn winrt_interfaces_still_use_offset_6() {
     // Parse a well-known WinRT interface (Windows.Foundation.IUriRuntimeClass or similar)
     // via the existing WinRT path — its first method should still have vtable_index = 6.
-    if !Path::new(WINDOWS_WINMD).exists() {
-        eprintln!("Skipping: Windows.winmd not available");
+    let Some(windows_winmd) = discovered_windows_winmd() else {
+        eprintln!("Skipping winrt_interfaces_still_use_offset_6: no Windows SDK Windows.winmd discoverable");
         return;
-    }
+    };
     // Take Windows.Foundation.Uri's default interface — pick one that has methods.
-    let class = meta::parse_class(WINDOWS_WINMD, "Windows.Foundation", "Uri")
+    let class = meta::parse_class(&windows_winmd, "Windows.Foundation", "Uri")
         .expect("Windows.Foundation.Uri must be present");
     let default_iface = class
         .default_interface

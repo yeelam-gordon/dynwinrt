@@ -495,6 +495,16 @@ fn emit_method_js(out: &mut String, m: &MethodMeta, iface_var: &str) {
         .iter()
         .filter(|p| p.direction == ParamDirection::In)
         .collect();
+    let out_params: Vec<&ParamMeta> = m
+        .params
+        .iter()
+        .filter(|p| p.direction == ParamDirection::Out)
+        .collect();
+    let has_outfill = m
+        .params
+        .iter()
+        .any(|p| p.direction == ParamDirection::OutFill);
+
     let param_list: Vec<String> = in_params
         .iter()
         .enumerate()
@@ -512,13 +522,107 @@ fn emit_method_js(out: &mut String, m: &MethodMeta, iface_var: &str) {
         camel = camel,
         params = param_list.join(", ")
     ));
-    out.push_str(&format!(
-        "        {iface_var}.method({slot}).invoke(this._obj, [{args}]);\n",
-        iface_var = iface_var,
-        slot = m.vtable_index,
-        args = args_exprs.join(", ")
-    ));
+    // Project trailing `[out]` params as JS return values, mirroring how the
+    // WinRT codegen already handles out-params (see
+    // `codegen/javascript/project/methods.rs` — `is_multi_output` / `invokeAll`).
+    // OutFill (caller-allocated buffers, e.g. GetPath(LPWSTR, cchMax)) are
+    // NOT projected — see the TODO note below.
+    if has_outfill {
+        out.push_str("        // TODO: caller-allocated [out, sizeis] buffers are not yet projected as returns.\n");
+    }
+    match out_params.len() {
+        0 => {
+            out.push_str(&format!(
+                "        {iface_var}.method({slot}).invoke(this._obj, [{args}]);\n",
+                iface_var = iface_var,
+                slot = m.vtable_index,
+                args = args_exprs.join(", ")
+            ));
+        }
+        1 => {
+            out.push_str(&format!(
+                "        const _out = {iface_var}.method({slot}).invoke(this._obj, [{args}]);\n",
+                iface_var = iface_var,
+                slot = m.vtable_index,
+                args = args_exprs.join(", ")
+            ));
+            out.push_str(&format!(
+                "        return {};\n",
+                unwrap_return_js(&out_params[0].typ, "_out")
+            ));
+        }
+        _ => {
+            out.push_str(&format!(
+                "        const _r = {iface_var}.method({slot}).invokeAll(this._obj, [{args}]);\n",
+                iface_var = iface_var,
+                slot = m.vtable_index,
+                args = args_exprs.join(", ")
+            ));
+            let items: Vec<String> = out_params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| unwrap_return_js(&p.typ, &format!("_r[{i}]")))
+                .collect();
+            out.push_str(&format!("        return [{}];\n", items.join(", ")));
+        }
+    }
     out.push_str("    }\n");
+}
+
+/// Unwrap the `DynWinRtValue` result of a method invocation into a natural JS
+/// value, according to the `[out]` param's declared type. Mirrors the WinRT
+/// codegen's `convert_return` for the primitive/GUID/enum/handle cases;
+/// Object/Interface/RuntimeClass currently return the raw `DynWinRtValue`
+/// (caller can `.cast(IID)` to bridge to another wrapper).
+fn unwrap_return_js(t: &TypeMeta, expr: &str) -> String {
+    if is_win32_bool(t) {
+        // Win32 BOOL marshals as i32 at the ABI; project as JS boolean.
+        return format!("({expr}.toNumber() !== 0)");
+    }
+    if handle_type_name(t).is_some() {
+        // Opaque Win32 handle (HWND, PWSTR, etc.) → raw pointer as bigint.
+        return format!("{expr}.toI64()");
+    }
+    match t {
+        TypeMeta::Bool => format!("{expr}.toBool()"),
+        TypeMeta::I8
+        | TypeMeta::U8
+        | TypeMeta::I16
+        | TypeMeta::U16
+        | TypeMeta::I32
+        | TypeMeta::U32
+        | TypeMeta::Char16 => format!("{expr}.toNumber()"),
+        TypeMeta::I64 | TypeMeta::U64 => format!("{expr}.toI64()"),
+        TypeMeta::F32 | TypeMeta::F64 => format!("{expr}.toF64()"),
+        TypeMeta::Guid => format!("{expr}.toGuid().toString()"),
+        TypeMeta::Enum { underlying, .. } => unwrap_return_js(underlying, expr),
+        TypeMeta::String => format!("{expr}.toString()"),
+        // Object / Interface / RuntimeClass / Struct pointer / etc.
+        // Return the raw DynWinRtValue and let the caller decide (e.g. cast).
+        _ => expr.to_string(),
+    }
+}
+
+/// `.d.ts` return-type text for a classic-COM plain method whose HRESULT is
+/// swallowed. Projects `[out]` params as the natural return type: 0 outs →
+/// `void`, 1 out → that type, N outs → a tuple.
+fn dts_return_type_for_outs(m: &MethodMeta) -> String {
+    let out_params: Vec<&ParamMeta> = m
+        .params
+        .iter()
+        .filter(|p| p.direction == ParamDirection::Out)
+        .collect();
+    match out_params.len() {
+        0 => "void".to_string(),
+        1 => ts_type_expr_dts(&out_params[0].typ),
+        _ => {
+            let items: Vec<String> = out_params
+                .iter()
+                .map(|p| ts_type_expr_dts(&p.typ))
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+    }
 }
 
 /// Emit an interop method: either natural (hide trailing REFIID + void**) or
@@ -681,7 +785,9 @@ fn render_dts(meta: &ComInterfaceMeta, interop: Option<&InteropInfo>) -> String 
                         .collect();
                     let ret = match &m.return_type {
                         None => "void".to_string(),
-                        Some(t) if is_hresult(t) => "void".to_string(),
+                        // HRESULT is swallowed by the runtime (throw on failure).
+                        // Project `[out]` params as the natural return instead.
+                        Some(t) if is_hresult(t) => dts_return_type_for_outs(m),
                         Some(t) => ts_type_expr_dts(t),
                     };
                     out.push_str(&format!(
@@ -711,7 +817,9 @@ fn render_dts(meta: &ComInterfaceMeta, interop: Option<&InteropInfo>) -> String 
                 .collect();
             let ret = match &m.return_type {
                 None => "void".to_string(),
-                Some(t) if is_hresult(t) => "void".to_string(),
+                // HRESULT is swallowed by the runtime (throw on failure).
+                // Project `[out]` params as the natural return instead.
+                Some(t) if is_hresult(t) => dts_return_type_for_outs(m),
                 Some(t) => ts_type_expr_dts(t),
             };
             out.push_str(&format!(
@@ -1548,5 +1656,264 @@ mod tests {
             .expect("plain classic-COM codegen must succeed with no winmds");
         assert!(out.js.contains("registerInterfaceUnknown"));
         assert!(out.js.contains("method(3)"));
+    }
+
+    // ---- Fix 4 (classic-COM plain `[out]` param → return-value projection) ----
+
+    fn plain_iface_with_method(m: MethodMeta) -> crate::meta::ComInterfaceMeta {
+        use crate::meta::{ComInterfaceMeta, InterfaceMeta};
+        let iface = InterfaceMeta {
+            name: "IHasOut".into(),
+            namespace: "Windows.Win32.System.Com".into(),
+            iid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            methods: vec![m],
+            generic_piid: None,
+            generic_args: Vec::new(),
+            doc: None,
+            deprecated: None,
+        };
+        ComInterfaceMeta {
+            interface: iface,
+            base_offset: 3,
+            is_iunknown_rooted: true,
+            base_chain: vec!["IUnknown".into()],
+            coclass_clsid: None,
+            coclass_name: None,
+            own_methods_start: 3,
+            referenced_enums: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plain_method_single_out_scalar_projects_as_return() {
+        // Model: `HRESULT GetShowCmd([out] int* pcmd)` — the classic single-out
+        // int shape. The out-int must become the method's return value.
+        let m = MethodMeta {
+            name: "GetShowCmd".into(),
+            vtable_index: 8,
+            params: vec![ParamMeta {
+                name: "pcmd".into(),
+                typ: TypeMeta::I32,
+                direction: ParamDirection::Out,
+            }],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        let com = plain_iface_with_method(m);
+        let js = render_js(&com, None);
+        let dts = render_dts(&com, None);
+        // .js: must capture `_out` and return it as a JS number.
+        assert!(
+            js.contains("const _out = _IHasOut.method(8).invoke(this._obj, [])"),
+            ".js must capture invoke() result into _out:\n{}",
+            js
+        );
+        assert!(
+            js.contains("return _out.toNumber();"),
+            ".js must unwrap the I32 out as _out.toNumber():\n{}",
+            js
+        );
+        // .d.ts: return type must be `number`, not `void`.
+        assert!(
+            dts.contains("getShowCmd(): number;"),
+            ".d.ts must project single-out I32 as `number`:\n{}",
+            dts
+        );
+    }
+
+    #[test]
+    fn plain_method_single_out_guid_projects_as_string() {
+        // Model: `HRESULT GetClassID([out] GUID* pClassID)` (IPersist shape).
+        let m = MethodMeta {
+            name: "GetClassID".into(),
+            vtable_index: 3,
+            params: vec![ParamMeta {
+                name: "pClassID".into(),
+                typ: TypeMeta::Guid,
+                direction: ParamDirection::Out,
+            }],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        let com = plain_iface_with_method(m);
+        let js = render_js(&com, None);
+        let dts = render_dts(&com, None);
+        assert!(
+            js.contains("const _out = _IHasOut.method(3).invoke(this._obj, [])"),
+            ".js must capture invoke() result into _out:\n{}",
+            js
+        );
+        assert!(
+            js.contains("return _out.toGuid().toString();"),
+            ".js must unwrap GUID out via .toGuid().toString():\n{}",
+            js
+        );
+        assert!(
+            dts.contains("getClassID(): string;"),
+            ".d.ts must project single-out GUID as `string`:\n{}",
+            dts
+        );
+    }
+
+    #[test]
+    fn plain_method_single_out_enum_projects_as_underlying() {
+        // Model: `HRESULT GetKind([out] MyKind* pk)` where MyKind is an I32
+        // enum. Underlying-scalar unwrap → `.toNumber()`; .d.ts uses the enum
+        // type name.
+        let m = MethodMeta {
+            name: "GetKind".into(),
+            vtable_index: 5,
+            params: vec![ParamMeta {
+                name: "pk".into(),
+                typ: TypeMeta::Enum {
+                    namespace: "Windows.Win32.System.Com".into(),
+                    name: "MyKind".into(),
+                    underlying: Box::new(TypeMeta::I32),
+                    members: Vec::new(),
+                    doc: None,
+                    deprecated: None,
+                },
+                direction: ParamDirection::Out,
+            }],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        let com = plain_iface_with_method(m);
+        let js = render_js(&com, None);
+        let dts = render_dts(&com, None);
+        assert!(
+            js.contains("return _out.toNumber();"),
+            ".js must unwrap enum out via underlying scalar (.toNumber()):\n{}",
+            js
+        );
+        assert!(
+            dts.contains("getKind(): MyKind;"),
+            ".d.ts must project enum out under the enum's declared name:\n{}",
+            dts
+        );
+    }
+
+    #[test]
+    fn plain_method_multi_out_uses_invoke_all_and_tuple_return() {
+        // Model: `HRESULT Q([out] uint32_t* a, [out] BOOL* found)` — two
+        // trailing out params must flip to `.invokeAll()` and a tuple return.
+        let m = MethodMeta {
+            name: "Q".into(),
+            vtable_index: 6,
+            params: vec![
+                ParamMeta {
+                    name: "a".into(),
+                    typ: TypeMeta::U32,
+                    direction: ParamDirection::Out,
+                },
+                ParamMeta {
+                    name: "found".into(),
+                    typ: TypeMeta::Bool,
+                    direction: ParamDirection::Out,
+                },
+            ],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        let com = plain_iface_with_method(m);
+        let js = render_js(&com, None);
+        let dts = render_dts(&com, None);
+        assert!(
+            js.contains("const _r = _IHasOut.method(6).invokeAll(this._obj, [])"),
+            ".js multi-out must use .invokeAll():\n{}",
+            js
+        );
+        assert!(
+            js.contains("return [_r[0].toNumber(), _r[1].toBool()];"),
+            ".js multi-out must return a tuple with each out unwrapped:\n{}",
+            js
+        );
+        assert!(
+            dts.contains("q(): [number, boolean];"),
+            ".d.ts multi-out must project a tuple type:\n{}",
+            dts
+        );
+    }
+
+    #[test]
+    fn plain_method_zero_out_still_discards_result() {
+        // No out params: existing behavior — invoke and discard.
+        let m = MethodMeta {
+            name: "DoIt".into(),
+            vtable_index: 4,
+            params: vec![ParamMeta {
+                name: "arg".into(),
+                typ: TypeMeta::I32,
+                direction: ParamDirection::In,
+            }],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        let com = plain_iface_with_method(m);
+        let js = render_js(&com, None);
+        let dts = render_dts(&com, None);
+        assert!(
+            !js.contains("const _out ="),
+            ".js zero-out must not capture invoke() result:\n{}",
+            js
+        );
+        assert!(
+            !js.contains("invokeAll"),
+            ".js zero-out must not use .invokeAll():\n{}",
+            js
+        );
+        assert!(
+            js.contains("_IHasOut.method(4).invoke(this._obj,"),
+            ".js zero-out must call plain .invoke():\n{}",
+            js
+        );
+        assert!(
+            dts.contains("doIt(arg: number): void;"),
+            ".d.ts zero-out must still be `void`:\n{}",
+            dts
+        );
+    }
+
+    #[test]
+    fn plain_method_outfill_stays_void_with_todo() {
+        // Caller-allocated `[out, sizeis]` buffers are NOT yet projected —
+        // emit a `TODO` comment and keep the surface as `void` so we don't
+        // half-break anything.
+        let m = MethodMeta {
+            name: "GetPath".into(),
+            vtable_index: 2,
+            params: vec![
+                ParamMeta {
+                    name: "pszFile".into(),
+                    typ: TypeMeta::String, // PWSTR buffer, caller-allocated
+                    direction: ParamDirection::OutFill,
+                },
+                ParamMeta {
+                    name: "cch".into(),
+                    typ: TypeMeta::I32,
+                    direction: ParamDirection::In,
+                },
+            ],
+            return_type: Some(make_hresult()),
+            ..Default::default()
+        };
+        let com = plain_iface_with_method(m);
+        let js = render_js(&com, None);
+        let dts = render_dts(&com, None);
+        assert!(
+            js.contains("TODO: caller-allocated [out, sizeis] buffers"),
+            ".js OutFill must include a TODO comment:\n{}",
+            js
+        );
+        assert!(
+            !js.contains("return _out") && !js.contains("return _r") && !js.contains("return [") ,
+            ".js OutFill must not return anything (avoid half-broken projection):\n{}",
+            js
+        );
+        assert!(
+            dts.contains("getPath(cch: number): void;"),
+            ".d.ts OutFill must stay `void`:\n{}",
+            dts
+        );
     }
 }
