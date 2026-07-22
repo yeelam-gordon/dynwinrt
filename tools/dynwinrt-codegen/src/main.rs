@@ -326,6 +326,35 @@ fn run() -> Result<(), String> {
                     }
                 }
 
+                // Fail loud: flat-Win32 [DllImport] and classic-COM codegen
+                // only emit `.js` + `.d.ts` today. If the user asked for a
+                // different language (e.g. `--lang py`) but any of the
+                // requested `--class-name` inputs resolved to a flat-Apis or
+                // classic-COM interface, silently writing JS files into a
+                // Python output directory would produce the wrong artifact
+                // types with no diagnostic. Reject the combination up front.
+                if lang != "js" && (!flat_apis.is_empty() || !com_interfaces.is_empty()) {
+                    let mut offenders: Vec<String> = Vec::new();
+                    for apis in &flat_apis {
+                        offenders.push(format!("{}.{} (flat-Win32 [DllImport])",
+                            apis.namespace, apis.class_name));
+                    }
+                    for ci in &com_interfaces {
+                        offenders.push(format!("{}.{} (classic-COM interface)",
+                            ci.interface.namespace, ci.interface.name));
+                    }
+                    return Err(format!(
+                        "`--lang {}` is not supported for flat-Win32 [DllImport] modules or \
+                         classic-COM interfaces (both emit only `.js` + `.d.ts` today). \
+                         Offending inputs: {}. Re-run with `--lang js`, or split the \
+                         invocation so the WinRT classes are generated with `--lang {}` and \
+                         the flat/COM classes with `--lang js`.",
+                        lang,
+                        offenders.join(", "),
+                        lang
+                    ));
+                }
+
                 // Emit flat-Win32 [DllImport] Apis modules (standalone; no
                 // WinRT index/barrel wiring — flat exports are a separate
                 // surface area).

@@ -614,3 +614,71 @@ fn flat_float_params_use_typed_wrappers_not_pointer() {
         out.js
     );
 }
+
+/// The CLI must fail loud when `--lang py` (or any non-`js` language) is
+/// combined with a `--class-name` that resolves to a flat-Win32 `[DllImport]`
+/// module — those emitters produce only `.js` + `.d.ts` and would otherwise
+/// silently write the wrong artifact types into the output directory.
+#[test]
+fn cli_rejects_non_js_lang_for_flat_apis() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let out_dir = std::env::temp_dir().join(format!(
+        "dynwinrt_codegen_reject_flat_py_{}",
+        std::process::id()
+    ));
+    if out_dir.exists() {
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.ancestors().nth(2).expect("workspace root");
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "-q",
+            "-p",
+            "dynwinrt-codegen",
+            "--",
+            "generate",
+            "--winmd",
+            WIN32_WINMD,
+            "--namespace",
+            REGISTRY_NS,
+            "--class-name",
+            "Apis",
+            "--lang",
+            "py",
+            "--output",
+        ])
+        .arg(out_dir.to_str().unwrap())
+        .current_dir(workspace_root)
+        .output()
+        .expect("run cargo");
+
+    assert!(
+        !output.status.success(),
+        "CLI must reject --lang py for a flat-Apis class (got success)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
+    assert!(
+        combined.contains("--lang py")
+            && (combined.contains("flat-Win32") || combined.contains("[DllImport]")),
+        "error must explain the flat-Win32 language mismatch. output was:\n{}",
+        combined
+    );
+    // And no artifacts should have been written.
+    assert!(
+        !out_dir.join("Apis.js").exists(),
+        "no .js should be written when the CLI rejects the invocation"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}
