@@ -16,6 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use dynwinrt_codegen::codegen::com;
+use dynwinrt_codegen::codegen::project::{get_import_name, set_import_name};
 use dynwinrt_codegen::meta;
 
 const WIN32_WINMD: &str = r"C:\s\win32metadata\Windows.Win32.winmd";
@@ -500,4 +501,141 @@ fn snapshot_itaskbarlist3() {
             mismatches.join("\n")
         );
     }
+}
+
+// -------------------------------------------------------------------------
+// --import-name honored by classic-COM path
+// -------------------------------------------------------------------------
+
+/// Regression test for a bug where the classic-COM generator hardcoded the
+/// runtime import as `'@microsoft/dynwinrt'`, ignoring the `--import-name`
+/// CLI flag (which the WinRT path already honored via
+/// `codegen::project::set_import_name`). Fixing this makes it possible to
+/// regenerate the Node E2E wrappers from `Windows.Win32.winmd` without
+/// hand-patching the import line.
+///
+/// The test uses the same thread-local as `set_import_name`, so it
+/// save/restores the default around the assertion to avoid contaminating
+/// other tests that assume the `@microsoft/dynwinrt` default (notably the
+/// snapshot tests). `#[serial]` is intentionally NOT used — because
+/// `RUNTIME_IMPORT_NAME` is a `thread_local!`, cargo's parallel test runner
+/// gives each thread its own copy; restoring on the same thread is enough.
+#[test]
+fn import_name_flag_is_honored_by_com_path() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+
+    let previous = get_import_name();
+    set_import_name("../dist/index.js");
+
+    let result = std::panic::catch_unwind(|| {
+        let com_iface = meta::parse_com_interface(
+            WIN32_WINMD,
+            "Windows.Win32.UI.Shell",
+            "ITaskbarList3",
+        )
+        .expect("ITaskbarList3 must exist");
+        com::generate_com_interface_files(&com_iface, WIN32_WINMD)
+            .expect("codegen must succeed for classic-COM interface")
+    });
+
+    // Always restore before propagating any assertion failure.
+    set_import_name(&previous);
+
+    let out = result.unwrap_or_else(|e| std::panic::resume_unwind(e));
+
+    // Custom import must appear on the runtime import line...
+    assert!(
+        out.js.contains("from '../dist/index.js'"),
+        "classic-COM .js must honor --import-name (expected `from '../dist/index.js'`):\n{}",
+        out.js
+    );
+    // ...and the hardcoded default must NOT be present in the generated body.
+    assert!(
+        !out.js.contains("'@microsoft/dynwinrt'"),
+        "classic-COM .js must NOT hardcode '@microsoft/dynwinrt' when --import-name is set:\n{}",
+        out.js
+    );
+
+    // Sanity: after restoring the default, subsequent generation reverts.
+    let default_out = {
+        let com_iface = meta::parse_com_interface(
+            WIN32_WINMD,
+            "Windows.Win32.UI.Shell",
+            "ITaskbarList3",
+        )
+        .expect("ITaskbarList3 must exist");
+        com::generate_com_interface_files(&com_iface, WIN32_WINMD)
+            .expect("codegen must succeed for classic-COM interface")
+    };
+    assert!(
+        default_out.js.contains("from '@microsoft/dynwinrt'"),
+        "after restoring, default import name must be back to '@microsoft/dynwinrt':\n{}",
+        default_out.js
+    );
+}
+
+/// Same test for the *interop wrapper* generation path (the second hardcoded
+/// site in `com.rs`) — regenerating `IDataTransferManagerInterop` with a
+/// custom import name should thread through to the emitted
+/// `DataTransferManager.js` companion.
+#[test]
+fn import_name_flag_is_honored_by_interop_wrapper() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    if discovered_windows_winmd().is_none() {
+        eprintln!("Skipping: no Windows SDK Windows.winmd discoverable (needed for interop resolution)");
+        return;
+    }
+
+    let previous = get_import_name();
+    set_import_name("../dist/index.js");
+
+    let result = std::panic::catch_unwind(|| {
+        let com_iface = meta::parse_com_interface(
+            WIN32_WINMD,
+            "Windows.Win32.UI.Shell",
+            "IDataTransferManagerInterop",
+        )
+        .expect("IDataTransferManagerInterop must exist");
+        com::generate_com_interface_files(&com_iface, WIN32_WINMD)
+            .expect("codegen must succeed for classic-COM interop interface")
+    });
+
+    set_import_name(&previous);
+    let out = result.unwrap_or_else(|e| std::panic::resume_unwind(e));
+
+    // The interop .js itself must honor the flag.
+    assert!(
+        out.js.contains("from '../dist/index.js'"),
+        "interop .js must honor --import-name:\n{}",
+        out.js
+    );
+    assert!(
+        !out.js.contains("'@microsoft/dynwinrt'"),
+        "interop .js must NOT hardcode '@microsoft/dynwinrt':\n{}",
+        out.js
+    );
+
+    // And the projected companion class file must honor it too.
+    let companion = out
+        .extra_files
+        .iter()
+        .find(|(name, _)| name == "DataTransferManager.js")
+        .map(|(_, content)| content.as_str())
+        .expect("DataTransferManager.js companion must be emitted");
+    assert!(
+        companion.contains("from '../dist/index.js'"),
+        "projected companion .js must honor --import-name:\n{}",
+        companion
+    );
+    assert!(
+        !companion.contains("'@microsoft/dynwinrt'"),
+        "projected companion .js must NOT hardcode '@microsoft/dynwinrt':\n{}",
+        companion
+    );
 }
