@@ -1,0 +1,454 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! TDD tests for flat-Win32 `[DllImport]` code generation from Windows.Win32.winmd.
+//!
+//! Covers:
+//! - Metadata discovery of `Apis`-class static DllImport methods (dll, entry
+//!   point, params with direction, return type).
+//! - Natural JS/DTS wrapper emission via `codegen::flat::generate_flat_apis_files`.
+//! - Corner cases: out-param projection, void/no-arg exports, partial generation,
+//!   and non-regression of the classic-COM / WinRT paths.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use dynwinrt_codegen::codegen::com;
+use dynwinrt_codegen::codegen::flat;
+use dynwinrt_codegen::meta;
+use dynwinrt_codegen::meta::{FlatAbiType, FlatDirection};
+
+const WIN32_WINMD: &str = r"C:\s\win32metadata\Windows.Win32.winmd";
+const REGISTRY_NS: &str = "Windows.Win32.System.Registry";
+
+fn win32_available() -> bool {
+    Path::new(WIN32_WINMD).exists()
+}
+
+// ---------------------------------------------------------------------------
+// NORMAL: metadata discovery
+// ---------------------------------------------------------------------------
+
+/// 1. Discover flat `[DllImport]` static methods for a namespace's `Apis`
+///    class. The `Apis` class must NOT be treated as a COM interface.
+#[test]
+fn discover_flat_apis_for_registry_namespace() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let apis = meta::parse_flat_apis(WIN32_WINMD, REGISTRY_NS, "Apis")
+        .expect("Registry Apis class should parse as a flat-DllImport container");
+    assert_eq!(apis.namespace, REGISTRY_NS);
+    assert_eq!(apis.class_name, "Apis");
+    assert!(!apis.methods.is_empty(), "must discover at least one flat method");
+    let names: Vec<&str> = apis.methods.iter().map(|m| m.name.as_str()).collect();
+    for expected in &["RegOpenKeyExW", "RegQueryValueExW", "RegCloseKey"] {
+        assert!(
+            names.contains(expected),
+            "expected `{expected}` in Registry Apis, got: {names:?}"
+        );
+    }
+
+    // The `Apis` class is NOT a COM interface — parse_com_interface should
+    // return None (no interface with that name) OR a Some whose IID is empty.
+    let as_com = meta::parse_com_interface(WIN32_WINMD, REGISTRY_NS, "Apis");
+    if let Some(ci) = as_com {
+        assert!(
+            ci.interface.iid.is_empty(),
+            "Apis is not a COM interface but parse_com_interface returned an IID"
+        );
+    }
+}
+
+/// 2. `RegOpenKeyExW` parses correctly: dll = advapi32.dll (any case),
+///    entry point = "RegOpenKeyExW", params in order, LSTATUS (i32) return.
+#[test]
+fn parse_reg_open_key_ex_w() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let apis = meta::parse_flat_apis(WIN32_WINMD, REGISTRY_NS, "Apis").unwrap();
+    let m = apis
+        .methods
+        .iter()
+        .find(|m| m.name == "RegOpenKeyExW")
+        .expect("RegOpenKeyExW must be discovered");
+    assert!(
+        m.dll.to_ascii_lowercase().starts_with("advapi32"),
+        "expected advapi32.dll, got {}",
+        m.dll
+    );
+    assert_eq!(m.entry_point, "RegOpenKeyExW");
+
+    // Return type: WIN32_ERROR is a U32 enum but at the ABI it's a 32-bit int
+    // (LSTATUS). The generator projects LSTATUS as a signed number.
+    match &m.return_type {
+        FlatAbiType::Enum { name, underlying, .. } => {
+            assert_eq!(name, "WIN32_ERROR");
+            assert!(matches!(**underlying, FlatAbiType::U32 | FlatAbiType::I32));
+        }
+        other => panic!("expected Enum return type for WIN32_ERROR, got {:?}", other),
+    }
+
+    // Params: hKey (HKEY), lpSubKey (PWSTR), ulOptions (u32), samDesired (enum),
+    // phkResult (PtrTo(HKEY), out).
+    assert_eq!(m.params.len(), 5);
+    let by = |n: &str| m.params.iter().find(|p| p.name == n).unwrap();
+
+    let hkey = by("hKey");
+    assert!(
+        matches!(&hkey.abi, FlatAbiType::Handle { name, .. } if name == "HKEY"),
+        "hKey must be Handle{{HKEY}}: {:?}",
+        hkey.abi
+    );
+    assert_eq!(hkey.direction, FlatDirection::In);
+
+    let sub = by("lpSubKey");
+    assert_eq!(sub.abi, FlatAbiType::PWStr);
+    assert_eq!(sub.direction, FlatDirection::In);
+
+    let opt = by("ulOptions");
+    assert_eq!(opt.abi, FlatAbiType::U32);
+    assert_eq!(opt.direction, FlatDirection::In);
+
+    let sam = by("samDesired");
+    assert!(
+        matches!(&sam.abi, FlatAbiType::Enum { name, .. } if name == "REG_SAM_FLAGS"),
+        "samDesired must be REG_SAM_FLAGS enum: {:?}",
+        sam.abi
+    );
+
+    let phk = by("phkResult");
+    match &phk.abi {
+        FlatAbiType::PtrTo(inner) => match inner.as_ref() {
+            FlatAbiType::Handle { name, .. } => assert_eq!(name, "HKEY"),
+            other => panic!("expected PtrTo(Handle{{HKEY}}), got PtrTo({:?})", other),
+        },
+        other => panic!("phkResult must be PtrTo(HKEY): {:?}", other),
+    }
+    assert_eq!(
+        phk.direction,
+        FlatDirection::Out,
+        "phkResult must be [out]"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NORMAL: natural wrapper emission
+// ---------------------------------------------------------------------------
+
+fn generate_registry_apis() -> flat::FlatGeneratedOutput {
+    let apis = meta::parse_flat_apis(WIN32_WINMD, REGISTRY_NS, "Apis").unwrap();
+    flat::generate_flat_apis_files(&apis)
+}
+
+/// 3. Emit a NATURAL wrapper whose `.js` calls
+///    `DynWinRtValue.flatInvoke('advapi32.dll', 'RegOpenKeyExW', 'I32', [...])`
+///    and whose `.d.ts` types params naturally — no raw `flatInvoke` string
+///    leaked at the typed surface.
+#[test]
+fn emit_natural_registry_wrapper() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let out = generate_registry_apis();
+
+    // The generated .js must call flatInvoke against advapi32 for each fn.
+    let js = &out.js;
+    assert!(
+        js.contains("flatInvoke"),
+        ".js must invoke DynWinRtValue.flatInvoke: {}",
+        js
+    );
+    assert!(
+        js.to_ascii_lowercase().contains("advapi32.dll"),
+        ".js must reference advapi32.dll"
+    );
+    for fname in &["RegOpenKeyExW", "RegQueryValueExW", "RegCloseKey"] {
+        assert!(
+            js.contains(&format!("'{fname}'")) || js.contains(&format!("\"{fname}\"")),
+            ".js must reference entry point `{fname}`"
+        );
+    }
+    // camelCase surface in .js
+    for camel in &["regOpenKeyExW", "regQueryValueExW", "regCloseKey"] {
+        assert!(
+            js.contains(&format!("{camel}(")),
+            ".js must expose `{camel}` as a natural function"
+        );
+    }
+
+    // .d.ts must NOT leak raw flatInvoke; params should be typed naturally.
+    let dts = &out.dts;
+    assert!(
+        !dts.contains("flatInvoke"),
+        ".d.ts must not leak raw flatInvoke"
+    );
+    // Natural types for the primary shapes.
+    assert!(
+        dts.contains("HKEY") || dts.contains("hkey"),
+        ".d.ts should surface HKEY typedef"
+    );
+    assert!(
+        dts.contains("string"),
+        ".d.ts should type LPCWSTR params as string"
+    );
+}
+
+/// 4. Partial generation: only the requested namespace/class is emitted;
+///    the CLI reference to another namespace's flat container is not required
+///    (this is a unit-level check on the meta layer).
+#[test]
+fn partial_generation_only_requested_namespace() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let registry = meta::parse_flat_apis(WIN32_WINMD, REGISTRY_NS, "Apis").unwrap();
+    for m in &registry.methods {
+        // Every method belongs to the Registry namespace's advapi32 exports.
+        assert!(
+            m.dll.to_ascii_lowercase().contains("advapi32")
+                || m.dll.to_ascii_lowercase().contains("kernel32")
+                || m.dll.to_ascii_lowercase().contains("api-ms-"),
+            "Registry Apis unexpectedly refers to {}",
+            m.dll
+        );
+    }
+}
+
+/// 5. Determinism: two consecutive generations of the same class emit
+///    byte-identical output.
+#[test]
+fn generation_is_deterministic() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let a = generate_registry_apis();
+    let b = generate_registry_apis();
+    assert_eq!(a.js, b.js, "generated .js must be deterministic");
+    assert_eq!(a.dts, b.dts, "generated .d.ts must be deterministic");
+    assert_eq!(
+        a.extra_files, b.extra_files,
+        "generated sibling files must be deterministic"
+    );
+}
+
+/// 5b. Snapshot: golden files under
+///     `tests/snapshots/registry_apis/`. Update the snapshot by running:
+///
+///     cargo run -p dynwinrt-codegen -- generate \
+///       --winmd C:\s\win32metadata\Windows.Win32.winmd \
+///       --namespace Windows.Win32.System.Registry \
+///       --class-name Apis \
+///       --output tools\dynwinrt-codegen\tests\snapshots\registry_apis
+#[test]
+fn snapshot_registry_apis() {
+    if !win32_available() {
+        eprintln!("Skipping snapshot: Win32 winmd not available");
+        return;
+    }
+    let out = generate_registry_apis();
+
+    let snapshot_dir: PathBuf =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/registry_apis");
+    if !snapshot_dir.exists() {
+        panic!(
+            "Snapshot directory not found: {}\n\
+             Create it and populate with the CLI shown above.",
+            snapshot_dir.display()
+        );
+    }
+
+    let mut generated: Vec<(String, String)> = Vec::new();
+    generated.push(("Apis.js".into(), out.js.clone()));
+    generated.push(("Apis.d.ts".into(), out.dts.clone()));
+    for (name, content) in &out.extra_files {
+        generated.push((name.clone(), content.clone()));
+    }
+
+    let mut mismatches: Vec<String> = Vec::new();
+    for (name, actual) in &generated {
+        let path = snapshot_dir.join(name);
+        if !path.exists() {
+            mismatches.push(format!("  missing snapshot: {}", name));
+            continue;
+        }
+        let expected = fs::read_to_string(&path).unwrap();
+        if actual.trim_end() != expected.trim_end() {
+            mismatches.push(format!("  differs: {}", name));
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&snapshot_dir) {
+        let names: std::collections::HashSet<String> =
+            generated.iter().map(|(n, _)| n.clone()).collect();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !names.contains(&name) {
+                mismatches.push(format!("  extra snapshot not generated: {}", name));
+            }
+        }
+    }
+    if !mismatches.is_empty() {
+        panic!(
+            "Registry Apis snapshot mismatch!\n{}\n\n\
+             To update, re-run the generator into the snapshot dir.",
+            mismatches.join("\n")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CORNER: out-param projection
+// ---------------------------------------------------------------------------
+
+/// 6. A flat method with an out-param (PHKEY on RegOpenKeyExW) projects the
+///    out as a return value. The generator hoists pure-Out pointer-to-scalar
+///    params into the return so the caller doesn't have to allocate a Buffer.
+#[test]
+fn out_param_projects_as_return() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let out = generate_registry_apis();
+    let dts = &out.dts;
+
+    // Locate the regOpenKeyExW declaration.
+    let sig_line = dts
+        .lines()
+        .find(|l| l.contains("regOpenKeyExW"))
+        .expect(".d.ts must declare regOpenKeyExW");
+
+    // The PHKEY out-slot must appear in the return type, NOT the parameter list.
+    // Extract just the parameter list (text between the FIRST `(` and its
+    // matching `)`) and assert `phkResult` is absent there. The return-type
+    // portion after the `:` is expected to contain it.
+    let open = sig_line
+        .find('(')
+        .expect("regOpenKeyExW signature must have a param list");
+    let close = sig_line[open..]
+        .find(')')
+        .map(|i| open + i)
+        .expect("regOpenKeyExW signature must close its param list");
+    let params = &sig_line[open + 1..close];
+    assert!(
+        !params.contains("phkResult"),
+        "regOpenKeyExW must hoist phkResult out of the params list; \
+         params were: `{params}` in full sig: {sig_line}"
+    );
+    // Return shape must include HKEY (either as bare or a field).
+    assert!(
+        sig_line.to_lowercase().contains("hkey"),
+        "regOpenKeyExW return type must expose the HKEY: {sig_line}"
+    );
+    // And the return type (text after the closing paren) MUST expose phkResult.
+    let ret = &sig_line[close..];
+    assert!(
+        ret.contains("phkResult"),
+        "regOpenKeyExW return type must expose phkResult: {ret}"
+    );
+}
+
+/// 7. Void / no-arg export: `RegCloseKey(HKEY) -> LSTATUS` — takes a single
+///    HKEY and returns just a status. Ensure the emitter handles the "no
+///    out-params" case cleanly.
+#[test]
+fn no_arg_and_void_returns_are_emitted() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let out = generate_registry_apis();
+    let js = &out.js;
+    let dts = &out.dts;
+    assert!(
+        js.contains("regCloseKey("),
+        ".js must expose regCloseKey"
+    );
+    let sig_line = dts
+        .lines()
+        .find(|l| l.contains("regCloseKey"))
+        .expect(".d.ts must declare regCloseKey");
+    // RegCloseKey has one [in] HKEY and returns LSTATUS. No out-param projection.
+    assert!(
+        sig_line.contains("HKEY") || sig_line.contains("hkey"),
+        "regCloseKey must accept an HKEY: {sig_line}"
+    );
+    assert!(
+        sig_line.contains("number") || sig_line.contains("void"),
+        "regCloseKey must have a numeric LSTATUS or void return: {sig_line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CORNER: non-regression
+// ---------------------------------------------------------------------------
+
+/// 8a. Generating a classic-COM interface (ITaskbarList3) still works.
+#[test]
+fn com_interface_generation_still_works() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let com_iface =
+        meta::parse_com_interface(WIN32_WINMD, "Windows.Win32.UI.Shell", "ITaskbarList3")
+            .expect("ITaskbarList3 must exist");
+    let out =
+        com::generate_com_interface_files(&com_iface, WIN32_WINMD).expect("COM codegen must succeed");
+    assert!(out.js.contains("class ITaskbarList3"));
+    assert!(out.dts.contains("ITaskbarList3"));
+}
+
+/// 8b. WinRT class generation isn't broken by the flat additions: try to
+///    invoke the CLI on `Windows.Foundation.Uri` and verify it emits Uri.js
+///    and Uri.d.ts. This exercises the full main.rs routing.
+#[test]
+fn winrt_generation_still_works() {
+    if !win32_available() {
+        eprintln!("Skipping: Win32 winmd not available");
+        return;
+    }
+    let out_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/tmp_gen_uri");
+    if out_dir.exists() {
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+    fs::create_dir_all(&out_dir).unwrap();
+
+    // Invoke the CLI via `cargo run`.
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .ancestors()
+        .nth(2)
+        .expect("workspace root");
+    let status = Command::new("cargo")
+        .args([
+            "run",
+            "-q",
+            "-p",
+            "dynwinrt-codegen",
+            "--",
+            "generate",
+            "--namespace",
+            "Windows.Foundation",
+            "--class-name",
+            "Uri",
+            "--output",
+        ])
+        .arg(out_dir.to_str().unwrap())
+        .current_dir(workspace_root)
+        .status()
+        .expect("run cargo");
+    assert!(status.success(), "CLI Uri generation should succeed");
+    assert!(out_dir.join("Uri.js").exists(), "expected Uri.js");
+    assert!(out_dir.join("Uri.d.ts").exists(), "expected Uri.d.ts");
+    // Clean up.
+    let _ = fs::remove_dir_all(&out_dir);
+}

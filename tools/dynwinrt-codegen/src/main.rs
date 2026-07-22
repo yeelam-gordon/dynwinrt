@@ -8,6 +8,7 @@ use std::path::Path;
 use clap::{Parser, Subcommand};
 
 use dynwinrt_codegen::codegen::com;
+use dynwinrt_codegen::codegen::flat;
 use dynwinrt_codegen::codegen::python;
 use dynwinrt_codegen::codegen::render_package_json;
 use dynwinrt_codegen::codegen::typescript;
@@ -270,13 +271,23 @@ fn run() -> Result<(), String> {
                     .filter(|s| !s.is_empty())
                     .collect();
 
-                // First: partition into WinRT classes and classic-COM interfaces.
-                // Prefer classic-COM ONLY when the found type is actually IUnknown-rooted
-                // (`is_iunknown_rooted == true`). IInspectable-rooted WinRT interfaces and
-                // WinRT runtime classes stay on the existing `parse_class`/WinRT pipeline.
+                // First: partition into WinRT classes, classic-COM interfaces,
+                // and flat-Win32 [DllImport] Apis classes.
                 let mut classes = Vec::new();
                 let mut com_interfaces: Vec<meta::ComInterfaceMeta> = Vec::new();
+                let mut flat_apis: Vec<meta::FlatApisMeta> = Vec::new();
                 for cls in &class_names {
+                    // Flat-Win32 [DllImport] discovery: an `Apis`-shaped class
+                    // whose methods carry DllImport module refs. If ANY method
+                    // qualifies, treat the whole class as a flat-exports module.
+                    // This runs BEFORE parse_com_interface because Win32 `Apis`
+                    // classes appear as classes (not interfaces) in metadata,
+                    // but this ordering guarantees we never fall through to
+                    // parse_class for a genuine flat-Apis class.
+                    if let Some(apis) = meta::parse_flat_apis(&winmd, ns, cls) {
+                        flat_apis.push(apis);
+                        continue;
+                    }
                     if let Some(com_iface) = meta::parse_com_interface(&winmd, ns, cls) {
                         // Route through classic-COM path when:
                         //   1) The interface is IUnknown-rooted (base +3), OR
@@ -312,6 +323,45 @@ fn run() -> Result<(), String> {
                         None => {
                             return Err(format!("Class {}.{} not found in {}", ns, cls, winmd));
                         }
+                    }
+                }
+
+                // Emit flat-Win32 [DllImport] Apis modules (standalone; no
+                // WinRT index/barrel wiring — flat exports are a separate
+                // surface area).
+                if !flat_apis.is_empty() {
+                    for apis in &flat_apis {
+                        let out = flat::generate_flat_apis_files(apis);
+                        let js_name = format!("{}.js", apis.class_name);
+                        let dts_name = format!("{}.d.ts", apis.class_name);
+                        if !dry_run {
+                            fs::write(output_dir.join(&js_name), &out.js).map_err(|e| {
+                                format!("Failed to write {}: {}", js_name, e)
+                            })?;
+                            fs::write(output_dir.join(&dts_name), &out.dts).map_err(|e| {
+                                format!("Failed to write {}: {}", dts_name, e)
+                            })?;
+                            for (name, content) in &out.extra_files {
+                                fs::write(output_dir.join(name), content).map_err(|e| {
+                                    format!("Failed to write {}: {}", name, e)
+                                })?;
+                            }
+                            println!(
+                                "Generated flat-Win32 {}.{} ({} methods, {} extra files)",
+                                apis.namespace,
+                                apis.class_name,
+                                apis.methods.len(),
+                                out.extra_files.len()
+                            );
+                        } else {
+                            println!(
+                                "[dry-run] Would generate flat-Win32 {}.{}",
+                                apis.namespace, apis.class_name
+                            );
+                        }
+                    }
+                    if classes.is_empty() && com_interfaces.is_empty() {
+                        return Ok(());
                     }
                 }
 
