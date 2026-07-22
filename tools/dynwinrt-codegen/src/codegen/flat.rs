@@ -46,12 +46,29 @@ pub struct FlatGeneratedOutput {
 // ---------------------------------------------------------------------------
 
 pub fn generate_flat_apis_files(meta: &FlatApisMeta) -> FlatGeneratedOutput {
-    let js = render_js(meta);
-    let dts = render_dts(meta);
+    // Fail-loud filter: methods whose return type isn't representable by the
+    // current `flatInvoke` ABI (I64/U64/F32/F64) MUST be skipped rather than
+    // silently emitted as a truncating I32 read. Print a per-skip warning so
+    // the operator sees what was omitted and why. When the underlying ABI
+    // gains support for these return kinds this filter should be relaxed.
+    let (kept, skipped) = partition_supported_methods(&meta.methods);
+    for (name, reason) in &skipped {
+        eprintln!(
+            "warning: dynwinrt-codegen: skipping flat export `{}::{}` — {}",
+            meta.class_name, name, reason
+        );
+    }
+    let filtered_meta = FlatApisMeta {
+        methods: kept,
+        ..meta.clone()
+    };
+
+    let js = render_js(&filtered_meta);
+    let dts = render_dts(&filtered_meta);
 
     // Sibling files: one per referenced enum.
     let mut extra_files: Vec<(String, String)> = Vec::new();
-    for en in &meta.referenced_enums {
+    for en in &filtered_meta.referenced_enums {
         if let TypeMeta::Enum { name, .. } = en {
             let (ejs, edts) = render_enum_files(en);
             extra_files.push((format!("{}.js", name), ejs));
@@ -64,6 +81,43 @@ pub fn generate_flat_apis_files(meta: &FlatApisMeta) -> FlatGeneratedOutput {
         js,
         dts,
         extra_files,
+    }
+}
+
+/// Split the methods into (kept, skipped). Skipped methods are those the
+/// codegen cannot yet emit correctly — silently emitting them would produce
+/// wrong-value wrappers (truncation, mis-marshalling), which violates the
+/// fail-loud principle applied elsewhere.
+fn partition_supported_methods(
+    methods: &[FlatMethodMeta],
+) -> (Vec<FlatMethodMeta>, Vec<(String, &'static str)>) {
+    let mut kept: Vec<FlatMethodMeta> = Vec::new();
+    let mut skipped: Vec<(String, &'static str)> = Vec::new();
+    for m in methods {
+        if let Some(reason) = unsupported_return_reason(&m.return_type) {
+            skipped.push((m.name.clone(), reason));
+            continue;
+        }
+        kept.push(m.clone());
+    }
+    (kept, skipped)
+}
+
+/// Returns `Some(reason)` if the given return type has no faithful mapping
+/// to the current `flatInvoke` return-kind ABI. `None` means the type is
+/// representable and the method can be emitted.
+fn unsupported_return_reason(t: &FlatAbiType) -> Option<&'static str> {
+    match t {
+        FlatAbiType::I64 | FlatAbiType::U64 => Some(
+            "return type is 64-bit integer; the current flatInvoke ABI has \
+             no I64/U64 return kind (would silently truncate to I32).",
+        ),
+        FlatAbiType::F32 | FlatAbiType::F64 => Some(
+            "return type is floating-point; the current flatInvoke ABI has \
+             no F32/F64 return kind (would silently mis-marshal as I32).",
+        ),
+        FlatAbiType::Enum { underlying, .. } => unsupported_return_reason(underlying),
+        _ => None,
     }
 }
 
@@ -145,6 +199,11 @@ fn is_status_return(t: &FlatAbiType) -> bool {
 
 fn flat_ret_kind_literal(t: &FlatAbiType) -> &'static str {
     // Map return type to the string literal passed to DynWinRtValue.flatInvoke.
+    // Callers with unsupported return kinds (I64/U64/F32/F64) must be filtered
+    // out upstream by `partition_supported_methods` — reaching this fn with
+    // those types would produce a silently-wrong I32 wrapper. We still return
+    // "I32" for them defensively but debug_assert to catch the missing-filter
+    // bug in tests. See `unsupported_return_reason`.
     match t {
         FlatAbiType::I32
         | FlatAbiType::I16
@@ -152,7 +211,10 @@ fn flat_ret_kind_literal(t: &FlatAbiType) -> &'static str {
         | FlatAbiType::Bool
         | FlatAbiType::Bool32 => "I32",
         FlatAbiType::U32 | FlatAbiType::U16 | FlatAbiType::U8 | FlatAbiType::Char16 => "U32",
-        FlatAbiType::I64 | FlatAbiType::U64 => "I32", // TODO: flatInvoke lacks I64 return kind
+        FlatAbiType::I64 | FlatAbiType::U64 => {
+            debug_assert!(false, "flat_ret_kind_literal: I64/U64 return should have been filtered upstream (see partition_supported_methods)");
+            "I32"
+        }
         FlatAbiType::Enum { underlying, .. } => match **underlying {
             FlatAbiType::I32 => "I32",
             FlatAbiType::I8 => "I32",
@@ -165,7 +227,10 @@ fn flat_ret_kind_literal(t: &FlatAbiType) -> &'static str {
         | FlatAbiType::PWStr
         | FlatAbiType::PStr
         | FlatAbiType::Handle { .. } => "Ptr",
-        FlatAbiType::F32 | FlatAbiType::F64 => "I32", // not supported; degrade gracefully
+        FlatAbiType::F32 | FlatAbiType::F64 => {
+            debug_assert!(false, "flat_ret_kind_literal: F32/F64 return should have been filtered upstream (see partition_supported_methods)");
+            "I32"
+        }
         FlatAbiType::Unknown => "I32",
     }
 }
@@ -612,7 +677,13 @@ fn wrap_arg_js(t: &FlatAbiType, var: &str) -> String {
         FlatAbiType::U32 => format!("DynWinRtValue.u32({var})"),
         FlatAbiType::I64 => format!("DynWinRtValue.i64(BigInt({var}))"),
         FlatAbiType::U64 => format!("DynWinRtValue.u64(BigInt({var}))"),
-        FlatAbiType::F32 | FlatAbiType::F64 => format!("DynWinRtValue.pointer({var})"),
+        // Emit correctly-typed float wrappers so the value round-trips as
+        // an IEEE-754 float, not a mis-marshalled pointer. If the Rust
+        // `flat_invoke` path doesn't yet accept F32/F64 args, this will
+        // throw a clear "unsupported arg kind" — fail loud, not silently
+        // wrong. Never emit `pointer(<float>)` here.
+        FlatAbiType::F32 => format!("DynWinRtValue.f32({var})"),
+        FlatAbiType::F64 => format!("DynWinRtValue.f64({var})"),
         FlatAbiType::PWStr | FlatAbiType::PStr => {
             format!("DynWinRtValue.pointer(_wideStringBuffer({var}))")
         }

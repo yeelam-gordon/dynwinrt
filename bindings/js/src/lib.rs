@@ -761,6 +761,19 @@ impl DynWinRTValue {
       )));
     }
 
+    // Fast path 4b: plain Uint8Array (NOT a Node.js Buffer subclass) →
+    // base data pointer. Buffer::from_napi_value above rejects raw
+    // Uint8Array views even though the TS surface (`ts_arg_type`) advertises
+    // Uint8Array. Handle it explicitly with the same semantics as Buffer.
+    if let Ok(arr) =
+      unsafe { napi::bindgen_prelude::Uint8Array::from_napi_value(raw_env, raw_val) }
+    {
+      let slice: &[u8] = arr.as_ref();
+      return Ok(DynWinRTValue(dynwinrt::WinRTValue::RawPtr(
+        slice.as_ptr() as *mut std::ffi::c_void,
+      )));
+    }
+
     // Fast path 5: existing DynWinRtValue → reuse its pointer.
     if let Ok(v) = unsafe { <&DynWinRTValue>::from_napi_value(raw_env, raw_val) } {
       return match &v.0 {
@@ -780,7 +793,7 @@ impl DynWinRTValue {
     }
 
     Err(napi::Error::from_reason(
-      "pointer(): expected bigint, Buffer, DynWinRtValue, null, or undefined",
+      "pointer(): expected bigint, number, Buffer, Uint8Array, DynWinRtValue, null, or undefined",
     ))
   }
 

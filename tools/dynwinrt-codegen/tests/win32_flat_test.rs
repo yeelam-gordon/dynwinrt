@@ -452,3 +452,160 @@ fn winrt_generation_still_works() {
     // Clean up.
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+// ---------------------------------------------------------------------------
+// FAIL-LOUD: unsupported return kinds must be skipped, not silently truncated
+// (Regression for the I64/U64/F32/F64 → I32 silent-degrade bug caught in code
+// review.)
+// ---------------------------------------------------------------------------
+
+use dynwinrt_codegen::meta::{FlatApisMeta, FlatMethodMeta, FlatParamMeta};
+
+fn synth_method(name: &str, ret: FlatAbiType) -> FlatMethodMeta {
+    FlatMethodMeta {
+        name: name.into(),
+        dll: "FAKE.dll".into(),
+        entry_point: name.into(),
+        return_type: ret,
+        params: vec![FlatParamMeta {
+            name: "arg".into(),
+            abi: FlatAbiType::U32,
+            direction: FlatDirection::In,
+        }],
+    }
+}
+
+fn synth_apis(methods: Vec<FlatMethodMeta>) -> FlatApisMeta {
+    FlatApisMeta {
+        namespace: "Fake.Ns".into(),
+        class_name: "Apis".into(),
+        methods,
+        referenced_enums: Vec::new(),
+    }
+}
+
+/// A flat export returning I64 (e.g. `GetTickCount64`) must NOT be emitted as
+/// an I32-returning wrapper (which would silently truncate to 32 bits). It
+/// must be skipped from the generated .js and .d.ts entirely.
+#[test]
+fn flat_skips_i64_return_instead_of_silently_truncating() {
+    let apis = synth_apis(vec![
+        synth_method("GoodStatus", FlatAbiType::I32),
+        synth_method("GetTickCount64", FlatAbiType::U64),
+        synth_method("GetLargeCounter", FlatAbiType::I64),
+    ]);
+    let out = flat::generate_flat_apis_files(&apis);
+    // Kept:
+    assert!(
+        out.js.contains("export function goodStatus"),
+        ".js must still include the supported method:\n{}",
+        out.js
+    );
+    // Skipped:
+    assert!(
+        !out.js.contains("getTickCount64"),
+        ".js must NOT include the U64-returning export (would truncate):\n{}",
+        out.js
+    );
+    assert!(
+        !out.js.contains("getLargeCounter"),
+        ".js must NOT include the I64-returning export (would truncate):\n{}",
+        out.js
+    );
+    assert!(
+        !out.dts.contains("getTickCount64") && !out.dts.contains("getLargeCounter"),
+        ".d.ts must NOT declare skipped exports:\n{}",
+        out.dts
+    );
+}
+
+/// A flat export returning F32 or F64 must be skipped for the same reason —
+/// the current flatInvoke ABI has no float return kind.
+#[test]
+fn flat_skips_float_return_instead_of_silently_mismarshalling() {
+    let apis = synth_apis(vec![
+        synth_method("Ok", FlatAbiType::I32),
+        synth_method("FloatFn", FlatAbiType::F32),
+        synth_method("DoubleFn", FlatAbiType::F64),
+    ]);
+    let out = flat::generate_flat_apis_files(&apis);
+    assert!(out.js.contains("export function ok"));
+    assert!(
+        !out.js.contains("floatFn") && !out.js.contains("doubleFn"),
+        ".js must NOT include F32/F64-returning exports:\n{}",
+        out.js
+    );
+}
+
+/// Enum returns whose underlying type is I64/U64/F32/F64 must be skipped too:
+/// the underlying-type widening in `flat_ret_kind_literal` would otherwise
+/// silently pick the wrong return kind.
+#[test]
+fn flat_skips_enum_return_over_unsupported_underlying() {
+    let bad_enum = FlatAbiType::Enum {
+        namespace: "Fake.Ns".into(),
+        name: "LargeStatus".into(),
+        underlying: Box::new(FlatAbiType::U64),
+        members: Vec::new(),
+    };
+    let apis = synth_apis(vec![
+        synth_method("Ok", FlatAbiType::I32),
+        synth_method("BigStatus", bad_enum),
+    ]);
+    let out = flat::generate_flat_apis_files(&apis);
+    assert!(out.js.contains("export function ok"));
+    assert!(
+        !out.js.contains("bigStatus"),
+        ".js must NOT include enum export whose underlying is U64:\n{}",
+        out.js
+    );
+}
+
+/// Float PARAMS (not returns) must be wrapped with typed `f32()`/`f64()` —
+/// NOT `pointer(...)`, which would silently mis-marshal an IEEE-754 float as
+/// a raw pointer. Passing a proper typed value means the wrapper fails
+/// loudly at runtime (if the ABI doesn't yet accept floats) rather than
+/// producing wrong values.
+#[test]
+fn flat_float_params_use_typed_wrappers_not_pointer() {
+    let m = FlatMethodMeta {
+        name: "SetLevel".into(),
+        dll: "FAKE.dll".into(),
+        entry_point: "SetLevel".into(),
+        return_type: FlatAbiType::I32,
+        params: vec![
+            FlatParamMeta {
+                name: "amount".into(),
+                abi: FlatAbiType::F32,
+                direction: FlatDirection::In,
+            },
+            FlatParamMeta {
+                name: "precise".into(),
+                abi: FlatAbiType::F64,
+                direction: FlatDirection::In,
+            },
+        ],
+    };
+    let out = flat::generate_flat_apis_files(&synth_apis(vec![m]));
+    assert!(
+        out.js.contains("DynWinRtValue.f32(amount)"),
+        ".js must wrap F32 param with typed f32():\n{}",
+        out.js
+    );
+    assert!(
+        out.js.contains("DynWinRtValue.f64(precise)"),
+        ".js must wrap F64 param with typed f64():\n{}",
+        out.js
+    );
+    // And crucially, must NOT be `pointer(<float>)`.
+    assert!(
+        !out.js.contains("DynWinRtValue.pointer(amount)"),
+        ".js must NOT pointer-wrap F32 (silent mis-marshal):\n{}",
+        out.js
+    );
+    assert!(
+        !out.js.contains("DynWinRtValue.pointer(precise)"),
+        ".js must NOT pointer-wrap F64 (silent mis-marshal):\n{}",
+        out.js
+    );
+}
