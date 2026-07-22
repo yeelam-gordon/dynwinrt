@@ -15,11 +15,38 @@
 // wrapper itself is codegen output; the composition (retry-on-more-data,
 // REG_SZ decode) is a thin ergonomic layer.
 
-import {
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+
+// The generated flat-Win32 Registry wrapper under
+// ./generated/flat_registry/ is a codegen fixture and is intentionally
+// gitignored. On a clean checkout it must be regenerated before this test can
+// run — otherwise a static import below would fail with an opaque
+// module-not-found error. Fail early with a helpful message that spells out
+// the exact regeneration command.
+const __dirname_flat = dirname(fileURLToPath(import.meta.url));
+const FLAT_FIXTURE = resolve(
+    __dirname_flat,
+    'generated/flat_registry/Apis.js'
+);
+if (!existsSync(FLAT_FIXTURE)) {
+    console.error(`[e2e] FAIL: flat_registry fixture not found: ${FLAT_FIXTURE}`);
+    console.error(`[e2e] This fixture is gitignored — regenerate it with:`);
+    console.error(`  cargo run -p dynwinrt-codegen -- generate \\`);
+    console.error(`    --winmd C:\\s\\win32metadata\\Windows.Win32.winmd \\`);
+    console.error(`    --namespace Windows.Win32.System.Registry \\`);
+    console.error(`    --class-name Apis \\`);
+    console.error(`    --output bindings/js/e2e/generated/flat_registry \\`);
+    console.error(`    --import-name ../../../dist/index.js`);
+    process.exit(1);
+}
+
+const {
     regOpenKeyExW,
     regQueryValueExW,
     regCloseKey,
-} from './generated/flat_registry/Apis.js';
+} = await import('./generated/flat_registry/Apis.js');
 
 // Predefined HKEY hive constants. These are stable Win32 pseudo-handles that
 // live in the same address slot on x86/x64 and are safe to pass as bigints.

@@ -415,8 +415,13 @@ fn winrt_generation_still_works() {
         eprintln!("Skipping: Win32 winmd not available");
         return;
     }
-    let out_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/tmp_gen_uri");
+    // Use a unique per-process directory under the OS temp dir to avoid
+    // cross-test interference when Rust runs tests in parallel and to prevent
+    // stale state from a previous interrupted run leaking in.
+    let out_dir = std::env::temp_dir().join(format!(
+        "dynwinrt_codegen_tmp_gen_uri_{}",
+        std::process::id()
+    ));
     if out_dir.exists() {
         let _ = fs::remove_dir_all(&out_dir);
     }
