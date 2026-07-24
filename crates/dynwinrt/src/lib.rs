@@ -6,6 +6,7 @@ use windows::core::*;
 mod abi;
 mod call;
 pub mod com;
+pub mod flat_call;
 mod interfaces;
 mod result;
 mod roapi;

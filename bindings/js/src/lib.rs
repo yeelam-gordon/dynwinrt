@@ -7,8 +7,9 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use dynwinrt;
-use napi::bindgen_prelude::BigInt;
+use napi::bindgen_prelude::{BigInt, Either};
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
+use napi::JsValue;
 use napi_derive::napi;
 use windows::core::{IUnknown, Interface, HSTRING};
 
@@ -585,6 +586,316 @@ impl DynWinRTValue {
       })
   }
 
+  /// Wrap a pointer/handle (BigInt, number, Buffer, Uint8Array, or null) as a
+  /// `WinRTValue::RawPtr` for classic-COM and flat-Win32 (`flatInvoke`) calls
+  /// with `void*` / HWND / PWSTR / handle / function-pointer parameters.
+  ///
+  /// Accepts:
+  ///   - BigInt: interpreted as a raw pointer value (u64 on x64).
+  ///   - number: a non-negative safe integer, interpreted as a raw pointer
+  ///     value (use a BigInt for pointers above `Number.MAX_SAFE_INTEGER`).
+  ///   - Buffer: uses the buffer's byte-pointer directly (does not clone).
+  ///     Caller keeps the Buffer alive for the duration of the COM call.
+  ///   - Uint8Array: same as Buffer — uses the view's data pointer directly.
+  ///   - null/undefined: null pointer.
+  #[napi]
+  pub fn pointer(
+    #[napi(
+      ts_arg_type = "bigint | number | Buffer | Uint8Array | null | undefined"
+    )]
+    value: napi::bindgen_prelude::Unknown,
+  ) -> napi::Result<DynWinRTValue> {
+    use napi::bindgen_prelude::FromNapiValue;
+    use napi::sys;
+
+    let raw_env = value.value().env;
+    let raw_val = value.value().value;
+
+    // Fast path 1: null / undefined → null pointer
+    let mut val_type = sys::ValueType::napi_undefined;
+    unsafe { sys::napi_typeof(raw_env, raw_val, &mut val_type) };
+    if val_type == sys::ValueType::napi_null || val_type == sys::ValueType::napi_undefined {
+      return Ok(DynWinRTValue::new(dynwinrt::WinRTValue::RawPtr(
+        std::ptr::null_mut(),
+      )));
+    }
+
+    // Fast path 2: BigInt → parse as u64 pointer bits.
+    //
+    // BigInt::get_u64() returns (sign_bit, magnitude, lossless). The tuple
+    // silently swallows negative values (sign=true is dropped) and values
+    // that don't fit in u64 (lossless=false → magnitude wraps). Validate
+    // both so that DynWinRtValue.pointer(-1n) or a >2^64 bigint produce a
+    // clean error instead of a fabricated pointer.
+    if val_type == sys::ValueType::napi_bigint {
+      let bi = unsafe { napi::bindgen_prelude::BigInt::from_napi_value(raw_env, raw_val) }?;
+      let (sign_bit, n, lossless) = bi.get_u64();
+      if sign_bit {
+        return Err(napi::Error::from_reason(
+          "pointer(): bigint must be non-negative (pointer values are unsigned)",
+        ));
+      }
+      if !lossless {
+        return Err(napi::Error::from_reason(
+          "pointer(): bigint exceeds u64 range; pointer values must fit in u64",
+        ));
+      }
+      if (n as usize as u64) != n {
+        return Err(napi::Error::from_reason(
+          "pointer(): bigint exceeds usize range on this platform",
+        ));
+      }
+      return Ok(DynWinRTValue::new(dynwinrt::WinRTValue::RawPtr(
+        n as usize as *mut std::ffi::c_void,
+      )));
+    }
+
+    // Fast path 3: Number → cast to usize (handy for HWNDs that fit in a
+    // JS number; the caller can also pass BigInt for safety).
+    //
+    // A float→int cast in Rust saturates and silently accepts NaN, negative,
+    // fractional, and >2^53 values — any of which could produce a bogus
+    // pointer. Validate that the value is a finite, non-negative safe
+    // integer that fits in usize, and require BigInt otherwise.
+    if val_type == sys::ValueType::napi_number {
+      let mut d: f64 = 0.0;
+      unsafe { sys::napi_get_value_double(raw_env, raw_val, &mut d) };
+      if !d.is_finite() {
+        return Err(napi::Error::from_reason(
+          "pointer(): number must be finite (got NaN or Infinity); use bigint for arbitrary pointer values",
+        ));
+      }
+      if d < 0.0 {
+        return Err(napi::Error::from_reason(
+          "pointer(): number must be non-negative; use bigint for arbitrary pointer values",
+        ));
+      }
+      if d.fract() != 0.0 {
+        return Err(napi::Error::from_reason(
+          "pointer(): number must be an integer; use bigint for arbitrary pointer values",
+        ));
+      }
+      // JS Number can only faithfully represent integers up to 2^53 - 1.
+      const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0; // (1 << 53) - 1
+      if d > MAX_SAFE_INTEGER {
+        return Err(napi::Error::from_reason(
+          "pointer(): number exceeds Number.MAX_SAFE_INTEGER; use bigint for arbitrary pointer values",
+        ));
+      }
+      let bits = d as u64;
+      if (bits as usize as u64) != bits {
+        return Err(napi::Error::from_reason(
+          "pointer(): number exceeds usize range on this platform; use bigint",
+        ));
+      }
+      return Ok(DynWinRTValue::new(dynwinrt::WinRTValue::RawPtr(
+        bits as usize as *mut std::ffi::c_void,
+      )));
+    }
+
+    // Fast path 4: Buffer / Uint8Array → base data pointer.
+    if let Ok(buf) = unsafe { napi::bindgen_prelude::Buffer::from_napi_value(raw_env, raw_val) } {
+      let slice: &[u8] = buf.as_ref();
+      return Ok(DynWinRTValue::new(dynwinrt::WinRTValue::RawPtr(
+        slice.as_ptr() as *mut std::ffi::c_void
+      )));
+    }
+
+    // Fast path 4b: plain Uint8Array (NOT a Node.js Buffer subclass) →
+    // base data pointer. Buffer::from_napi_value above rejects raw
+    // Uint8Array views even though the TS surface (`ts_arg_type`) advertises
+    // Uint8Array. Handle it explicitly with the same semantics as Buffer.
+    if let Ok(arr) = unsafe { napi::bindgen_prelude::Uint8Array::from_napi_value(raw_env, raw_val) }
+    {
+      let slice: &[u8] = arr.as_ref();
+      return Ok(DynWinRTValue::new(dynwinrt::WinRTValue::RawPtr(
+        slice.as_ptr() as *mut std::ffi::c_void
+      )));
+    }
+
+    // Fast path 5: existing DynWinRtValue → reject. Borrowing an Object's raw
+    // COM pointer here makes it indistinguishable from an owned raw pointer to
+    // adoptComPointer(), which can double-release the original wrapper's COM
+    // object. Callers that already have raw pointer bits should pass those bits.
+    if let Ok(v) = unsafe { <&DynWinRTValue>::from_napi_value(raw_env, raw_val) } {
+      let kind = v.0.get_type_kind();
+      return Err(napi::Error::from_reason(format!(
+        "pointer(): DynWinRtValue inputs are not accepted (got {:?}); pass raw pointer bits, Buffer/Uint8Array, or null instead",
+        kind
+      )));
+    }
+
+    Err(napi::Error::from_reason(
+      "pointer(): expected bigint, number, Buffer, Uint8Array, null, or undefined",
+    ))
+  }
+
+  /// Get the underlying pointer of an Object/RawPtr value as a BigInt.
+  /// Useful for turning a `flatInvoke` pointer result (e.g. HWND from
+  /// `GetConsoleWindow`) into a bigint you can then feed into other calls.
+  #[napi]
+  pub fn as_pointer_bigint(&self) -> napi::Result<BigInt> {
+    let bits: usize = match &self.0 {
+      dynwinrt::WinRTValue::Object(o) => o.as_raw() as usize,
+      dynwinrt::WinRTValue::RawPtr(p) => *p as usize,
+      dynwinrt::WinRTValue::Null => 0,
+      _ => {
+        return Err(napi::Error::from_reason(format!(
+          "asPointerBigint: not a pointer/object value ({:?})",
+          self.0.get_type_kind()
+        )));
+      }
+    };
+    Ok(BigInt::from(bits as u64))
+  }
+
+  /// Decode an I64 value as a JS BigInt without truncating through Number.
+  #[napi(js_name = "toI64BigInt")]
+  pub fn to_i64_bigint(&self) -> napi::Result<BigInt> {
+    match &self.0 {
+      dynwinrt::WinRTValue::I64(v) => Ok(BigInt::from(*v)),
+      _ => Err(napi::Error::from_reason(format!(
+        "toI64BigInt: not an I64 value ({:?})",
+        self.0.get_type_kind()
+      ))),
+    }
+  }
+
+  /// Decode a U64 value as a JS BigInt without truncating through Number.
+  #[napi(js_name = "toU64BigInt")]
+  pub fn to_u64_bigint(&self) -> napi::Result<BigInt> {
+    match &self.0 {
+      dynwinrt::WinRTValue::U64(v) => Ok(BigInt::from(*v)),
+      _ => Err(napi::Error::from_reason(format!(
+        "toU64BigInt: not a U64 value ({:?})",
+        self.0.get_type_kind()
+      ))),
+    }
+  }
+
+  /// Invoke a flat Win32 export via `LoadLibraryW` + `GetProcAddress` + libffi.
+  /// `retKind` selects the return marshalling:
+  /// `'Void' | 'I32' | 'U32' | 'I64' | 'U64' | 'F32' | 'F64' | 'Ptr'`.
+  ///
+  /// `args` may contain: `DynWinRtValue.i32(...)`, `DynWinRtValue.u32(...)`,
+  /// `DynWinRtValue.i64(...)`, `DynWinRtValue.u64(...)`,
+  /// `DynWinRtValue.f32(...)`, `DynWinRtValue.f64(...)`, or
+  /// `DynWinRtValue.pointer(...)`. Other kinds cause a runtime error.
+  ///
+  /// ## ABI / signature safety (IMPORTANT)
+  ///
+  /// This performs a raw libffi call using ONLY the `retKind` and the runtime
+  /// kinds of the `args` you pass — it has no knowledge of the target export's
+  /// real signature. Passing the wrong argument COUNT, the wrong argument ABI
+  /// kinds, or the wrong `retKind` for the actual export produces an ABI
+  /// mismatch that libffi cannot detect: it can read/write the wrong registers
+  /// or stack slots, crash the Node process, or corrupt memory. There is no
+  /// safety net here.
+  ///
+  /// Prefer the generated `dynwinrt-codegen --lang js` wrappers, which encode
+  /// the exact parameter/return ABI taken from the winmd for each export. Only
+  /// call `flatInvoke` directly if you have independently verified the target's
+  /// signature and are marshalling every argument and the return to match it.
+  ///
+  /// ## DLL loading (SECURITY)
+  ///
+  /// This ultimately calls `LoadLibraryW`, which uses the default DLL
+  /// search order. That means an untrusted DLL name (or a bare short
+  /// name where a same-named DLL exists in the process's working
+  /// directory / PATH earlier than the intended system location) can
+  /// silently resolve to an attacker-controlled binary — the classic
+  /// "DLL preloading / hijacking" attack. Pass DLLs that are either:
+  ///
+  ///   - Well-known system DLLs whose search-order first hit is under
+  ///     `System32` (e.g. `'kernel32.dll'`, `'user32.dll'`,
+  ///     `'ADVAPI32.dll'`) — safe on standard Windows installs
+  ///     provided the app itself has not tampered with the search path.
+  ///   - Or a fully qualified absolute path (`C:\\Path\\To\\my.dll`)
+  ///     that you control and have integrity-checked.
+  ///
+  /// Do NOT accept the DLL name from untrusted input. The generated
+  /// `--lang js` wrappers emitted by `dynwinrt-codegen` always pass a
+  /// hard-coded DLL name matched to a specific export in the winmd.
+  ///
+  /// ## Buffer lifetimes (IMPORTANT)
+  ///
+  /// `DynWinRtValue.pointer(Buffer | Uint8Array)` intentionally stores
+  /// only the raw pointer bits (`slice.as_ptr()`) — it does NOT retain
+  /// the underlying JS Buffer/typed array, so the array is eligible for
+  /// GC the moment the last JS reference to it drops. If you inline a
+  /// buffer allocation into the argument list, e.g.
+  /// `pointer(Buffer.alloc(32))` or `pointer(_wideStringBuffer(x))`,
+  /// the temporary buffer becomes unreachable the moment `pointer(...)`
+  /// returns, and can be reclaimed BEFORE `flatInvoke` reaches the
+  /// native call — passing a dangling pointer to the Win32 export.
+  ///
+  /// Always keep the original buffer alive in a named local until
+  /// `flatInvoke` returns:
+  ///
+  /// ```js
+  /// // BAD — temporary buffer may be GC'd before flatInvoke runs.
+  /// DynWinRtValue.flatInvoke(dll, entry, 'I32',
+  ///     [DynWinRtValue.pointer(Buffer.alloc(32))]);
+  ///
+  /// // GOOD — buf remains reachable through the function's scope.
+  /// const buf = Buffer.alloc(32);
+  /// DynWinRtValue.flatInvoke(dll, entry, 'I32',
+  ///     [DynWinRtValue.pointer(buf)]);
+  /// ```
+  ///
+  /// The codegen output emitted by `dynwinrt-codegen --lang js` follows
+  /// this rule: every wide/narrow string wrapper and every out-slot
+  /// `Buffer.alloc` is hoisted to a named `const` before the
+  /// `flatInvoke` call. Hand-written callers must do the same.
+  ///
+  /// ## DLL residency and `'Ptr'` returns
+  ///
+  /// Each distinct DLL is loaded once with `LoadLibraryW` and cached for
+  /// the lifetime of the process; it is intentionally never `FreeLibrary`'d
+  /// (see `flat_call::flat_invoke`). A `retKind: 'Ptr'` result (a raw
+  /// pointer / function pointer / handle) that points INTO a loaded module
+  /// therefore stays valid after the call returns, because the module is
+  /// never unloaded. `LoadLibraryW` uses the default DLL search order, so
+  /// pass a trusted or fully qualified DLL path to avoid DLL
+  /// preloading/hijacking risks.
+  #[napi]
+  pub fn flat_invoke(
+    dll: String,
+    entry: String,
+    ret_kind: String,
+    args: Vec<&DynWinRTValue>,
+  ) -> napi::Result<DynWinRTValue> {
+    let ret = match ret_kind.to_ascii_lowercase().as_str() {
+      "void" => dynwinrt::flat_call::FlatReturnKind::Void,
+      "i32" => dynwinrt::flat_call::FlatReturnKind::I32,
+      "u32" => dynwinrt::flat_call::FlatReturnKind::U32,
+      "i64" => dynwinrt::flat_call::FlatReturnKind::I64,
+      "u64" => dynwinrt::flat_call::FlatReturnKind::U64,
+      "f32" => dynwinrt::flat_call::FlatReturnKind::F32,
+      "f64" => dynwinrt::flat_call::FlatReturnKind::F64,
+      "ptr" | "pointer" => dynwinrt::flat_call::FlatReturnKind::Ptr,
+      other => {
+        return Err(napi::Error::from_reason(format!(
+          "flatInvoke: unsupported return kind '{}' (expected 'Void', 'I32', 'U32', 'I64', 'U64', 'F32', 'F64', or 'Ptr')",
+          other
+        )));
+      }
+    };
+    let wrt_args: Vec<dynwinrt::WinRTValue> = args.iter().map(|a| a.0.clone()).collect();
+    let result = unsafe { dynwinrt::flat_call::flat_invoke(&dll, &entry, ret, &wrt_args) }
+      .map_err(|e| {
+        napi::Error::from_reason(format!("flatInvoke({}!{}): {}", dll, entry, e.message()))
+      })?;
+    Ok(DynWinRTValue::new(result))
+  }
+
+  /// Return `GetLastError()` as a u32. Companion to `flatInvoke` for functions
+  /// that use the SetLastError model (e.g. `GetModuleHandleW`).
+  #[napi]
+  pub fn flat_last_error() -> u32 {
+    dynwinrt::flat_call::get_last_error()
+  }
+
   #[napi]
   pub fn bool_value(value: bool) -> DynWinRTValue {
     DynWinRTValue::new(dynwinrt::WinRTValue::Bool(value))
@@ -618,8 +929,34 @@ impl DynWinRTValue {
     DynWinRTValue::new(dynwinrt::WinRTValue::I64(value))
   }
   #[napi]
-  pub fn u64(value: i64) -> DynWinRTValue {
-    DynWinRTValue::new(dynwinrt::WinRTValue::U64(value as u64))
+  pub fn u64(
+    #[napi(ts_arg_type = "number | bigint")] value: Either<BigInt, f64>,
+  ) -> napi::Result<DynWinRTValue> {
+    // Accept either a JS `bigint` (full unsigned-64 range) or a plain `number`
+    // (the common case — WinRT/collection codegen passes numeric sizes/positions
+    // without a BigInt wrapper). The bigint path is lossless; the number path is
+    // validated as a non-negative safe integer so an out-of-range or fractional
+    // number is rejected rather than silently rounded/truncated into a wrong u64.
+    let v: u64 = match value {
+      Either::A(bi) => {
+        let (negative, value, lossless) = bi.get_u64();
+        if negative || !lossless {
+          return Err(napi::Error::from_reason(
+            "DynWinRtValue.u64(): value must fit in an unsigned 64-bit integer",
+          ));
+        }
+        value
+      }
+      Either::B(n) => {
+        if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > 9_007_199_254_740_991.0 {
+          return Err(napi::Error::from_reason(
+            "DynWinRtValue.u64(): number must be a non-negative safe integer (use a bigint for values above 2^53-1)",
+          ));
+        }
+        n as u64
+      }
+    };
+    Ok(DynWinRTValue::new(dynwinrt::WinRTValue::U64(v)))
   }
   #[napi]
   pub fn f32(value: f64) -> DynWinRTValue {
