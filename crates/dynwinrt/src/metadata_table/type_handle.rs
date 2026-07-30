@@ -144,9 +144,9 @@ impl TypeHandle {
             TypeKind::U64 => AbiType::U64,
             TypeKind::F32 => AbiType::F32,
             TypeKind::F64 => AbiType::F64,
+            TypeKind::Guid => AbiType::Guid,
 
             TypeKind::HString
-            | TypeKind::Guid
             | TypeKind::Object
             | TypeKind::Interface(_)
             | TypeKind::Delegate(_)
@@ -322,7 +322,13 @@ impl TypeHandle {
                 TypeKind::Object
                 | TypeKind::Interface(_)
                 | TypeKind::Delegate(_)
-                | TypeKind::RuntimeClass(_) => Ok(WinRTValue::Object(IUnknown::from_raw(ptr))),
+                | TypeKind::RuntimeClass(_) => {
+                    if ptr.is_null() {
+                        Ok(WinRTValue::Null)
+                    } else {
+                        Ok(WinRTValue::Object(IUnknown::from_raw(ptr)))
+                    }
+                }
 
                 TypeKind::HString => Ok(WinRTValue::HString(std::mem::transmute(ptr))),
 
@@ -331,6 +337,9 @@ impl TypeHandle {
                 ))),
 
                 TypeKind::Parameterized(idx) => {
+                    if ptr.is_null() {
+                        return Ok(WinRTValue::Null);
+                    }
                     let (generic_def, args) = self.table.get_parameterized(idx);
                     if is_async_piid(generic_def) {
                         let raw = IUnknown::from_raw(ptr);
@@ -345,6 +354,9 @@ impl TypeHandle {
                 | TypeKind::IAsyncActionWithProgress(_)
                 | TypeKind::IAsyncOperation(_)
                 | TypeKind::IAsyncOperationWithProgress(_) => {
+                    if ptr.is_null() {
+                        return Ok(WinRTValue::Null);
+                    }
                     let raw = IUnknown::from_raw(ptr);
                     let info: windows_future::IAsyncInfo = raw
                         .cast()
@@ -381,6 +393,7 @@ impl TypeHandle {
             (TypeKind::U64, AbiValue::U64(v)) => Ok(WinRTValue::U64(*v)),
             (TypeKind::F32, AbiValue::F32(v)) => Ok(WinRTValue::F32(*v)),
             (TypeKind::F64, AbiValue::F64(v)) => Ok(WinRTValue::F64(*v)),
+            (TypeKind::Guid, AbiValue::Guid(v)) => Ok(WinRTValue::Guid(*v)),
 
             (
                 TypeKind::Object
@@ -388,7 +401,13 @@ impl TypeHandle {
                 | TypeKind::Delegate(_)
                 | TypeKind::RuntimeClass(_),
                 AbiValue::Pointer(p),
-            ) => Ok(WinRTValue::Object(unsafe { IUnknown::from_raw(*p) })),
+            ) => {
+                if p.is_null() {
+                    Ok(WinRTValue::Null)
+                } else {
+                    Ok(WinRTValue::Object(unsafe { IUnknown::from_raw(*p) }))
+                }
+            }
 
             (TypeKind::HString, AbiValue::Pointer(p)) => {
                 Ok(WinRTValue::HString(unsafe { core::mem::transmute(*p) }))
@@ -399,6 +418,9 @@ impl TypeHandle {
             }
 
             (TypeKind::Parameterized(idx), AbiValue::Pointer(p)) => {
+                if p.is_null() {
+                    return Ok(WinRTValue::Null);
+                }
                 let (generic_def, args) = self.table.get_parameterized(idx);
                 if is_async_piid(generic_def) {
                     let raw = unsafe { IUnknown::from_raw(*p) };

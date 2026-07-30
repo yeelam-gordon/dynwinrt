@@ -8,6 +8,10 @@ use windows_metadata::{HasAttributes, reader};
 
 use crate::types::{EnumMember, TypeKind, TypeMeta, TypeRef};
 
+pub const WINDOWS_FOUNDATION_COLLECTIONS_NAMESPACE: &str = "Windows.Foundation.Collections";
+pub const PIID_IVECTOR: &str = "913337e9-11a1-4345-a3a2-4e7f956e222d";
+pub const PIID_IOBSERVABLE_VECTOR: &str = "5917eb53-50b4-4a0d-b309-65862b3f1dbc";
+
 /// Direction of a method parameter at the ABI level.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamDirection {
@@ -619,6 +623,18 @@ fn collect_all_refs_from_interfaces(
 ) {
     for i in interfaces {
         collect_all_refs_from_methods(&i.methods, known, named_out, param_out);
+        if i.generic_piid.as_deref() == Some(PIID_IOBSERVABLE_VECTOR) && i.generic_args.len() == 1 {
+            let vector = TypeMeta::Parameterized {
+                namespace: WINDOWS_FOUNDATION_COLLECTIONS_NAMESPACE.into(),
+                name: "IVector".into(),
+                piid: PIID_IVECTOR.into(),
+                args: i.generic_args.clone(),
+            };
+            let concrete_name = make_parameterized_name("IVector", &i.generic_args);
+            if !known.contains(&concrete_name) {
+                param_out.push(vector);
+            }
+        }
     }
 }
 
@@ -679,7 +695,7 @@ pub fn expand_winmd_paths(winmd_paths: &str) -> String {
     all_paths.join(";")
 }
 
-fn load_index(winmd_paths: &str) -> Option<reader::Index> {
+pub(crate) fn load_index(winmd_paths: &str) -> Option<reader::Index> {
     let paths: Vec<&str> = winmd_paths.split(';').filter(|s| !s.is_empty()).collect();
     if paths.is_empty() {
         eprintln!("warning: no winmd paths provided");
@@ -1194,7 +1210,7 @@ fn type_meta_to_winmd_type(typ: &TypeMeta) -> windows_metadata::Type {
     }
 }
 
-fn extract_iid(def: &reader::TypeDef) -> String {
+pub(crate) fn extract_iid(def: &reader::TypeDef) -> String {
     if let Some(attr) = def.find_attribute("GuidAttribute") {
         let args: Vec<(String, windows_metadata::Value)> = attr.value();
         if args.len() >= 11 {
@@ -1294,7 +1310,7 @@ fn map_winmd_type(ty: &windows_metadata::Type, index: &reader::Index) -> TypeMet
     map_winmd_type_with_generics(ty, index, &[])
 }
 
-fn map_winmd_type_with_generics(
+pub(crate) fn map_winmd_type_with_generics(
     ty: &windows_metadata::Type,
     index: &reader::Index,
     generic_args: &[TypeMeta],
@@ -1817,6 +1833,9 @@ mod tests {
 
 #[cfg(test)]
 mod iface_tests {
+    use std::collections::HashSet;
+
+    use crate::types::TypeMeta;
     use windows_metadata::reader;
     const WINDOWS_WINMD: &str =
         r"C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0\Windows.winmd";
@@ -1886,5 +1905,68 @@ mod iface_tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn observable_vector_discovers_mutable_vector_dependency() {
+        let interface = super::InterfaceMeta {
+            name: "IObservableVector_ICommandBarElement".into(),
+            namespace: "Windows.Foundation.Collections".into(),
+            generic_piid: Some(super::PIID_IOBSERVABLE_VECTOR.into()),
+            generic_args: vec![TypeMeta::Interface {
+                namespace: "Microsoft.UI.Xaml.Controls".into(),
+                name: "ICommandBarElement".into(),
+                iid: "f8eb20b4-373e-5327-9942-66a1ea21f5f9".into(),
+            }],
+            ..Default::default()
+        };
+        let mut named = Vec::new();
+        let mut parameterized = Vec::new();
+
+        super::collect_all_refs_from_interfaces(
+            &[interface],
+            &HashSet::new(),
+            &mut named,
+            &mut parameterized,
+        );
+
+        assert!(named.is_empty());
+        assert_eq!(parameterized.len(), 1);
+        assert!(matches!(
+            &parameterized[0],
+            TypeMeta::Parameterized {
+                namespace,
+                name,
+                piid,
+                args,
+            } if namespace == super::WINDOWS_FOUNDATION_COLLECTIONS_NAMESPACE
+                && name == "IVector"
+                && piid == super::PIID_IVECTOR
+                && args == &vec![TypeMeta::Interface {
+                    namespace: "Microsoft.UI.Xaml.Controls".into(),
+                    name: "ICommandBarElement".into(),
+                    iid: "f8eb20b4-373e-5327-9942-66a1ea21f5f9".into(),
+                }]
+        ));
+    }
+
+    #[test]
+    fn observable_vector_dependency_is_resolved_for_emission() {
+        let observable = super::InterfaceMeta {
+            name: "IObservableVector_String".into(),
+            namespace: "Windows.Foundation.Collections".into(),
+            generic_piid: Some(super::PIID_IOBSERVABLE_VECTOR.into()),
+            generic_args: vec![TypeMeta::String],
+            ..Default::default()
+        };
+
+        let dependencies = super::resolve_dependencies(WINDOWS_WINMD, &[], &[observable], &[]);
+
+        assert!(
+            dependencies
+                .interfaces
+                .iter()
+                .any(|interface| interface.name == "IVector_String")
+        );
     }
 }
